@@ -1,0 +1,17 @@
+{
+  "name": "Bee's Pizza · Checklist de limpieza",
+  "short_name": "Bee's Limpieza",
+  "description": "Rutina de limpieza y entregas de turno de Bee's Pizza Sullivan.",
+  "lang": "es-MX",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#FFF6DE",
+  "theme_color": "#F5B324",
+  "icons": [
+    { "src": "/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "/icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}
