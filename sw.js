@@ -1,5 +1,5 @@
 /* Bee's Limpieza · service worker: app instalable, funciona con mala señal y recibe avisos. */
-const CACHE = "bees-limpieza-v1";
+const CACHE = "bees-limpieza-v3";
 const SHELL = ["/", "/index.html", "/app.js", "/shared.js", "/manifest.webmanifest", "/icon-192.png", "/icon-512.png"];
 
 self.addEventListener("install", (e) => {

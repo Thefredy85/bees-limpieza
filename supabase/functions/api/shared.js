@@ -3,7 +3,7 @@
 
 export const TZ_OFFSET_MIN = -360;
 export const TOL = 15;              /* tolerancia en minutos */
-export const OPEN_MIN = 660;        /* 11:00 inicio de rutina */
+export const OPEN_MIN = 660;        /* 11:00 inicio de rutina por defecto */
 export const CUT_MIN = 1410;        /* 23:30 fin de rutina (todos los días) */
 export const DAY_START = 360;       /* 6:00 cambio de jornada */
 export const REP_MIN = 20;          /* minutos para repetir una tarea */
@@ -129,14 +129,16 @@ export function califRutina(docs) {
 
 /* ---------- Rutina ---------- */
 /* Horarios esperados. H: hora programada · dl: límite a tiempo · from/to: cuándo cuenta un registro. */
-export function schedule(r) {
+export function schedule(r, ini) {
   const out = [];
   if (r.win) {
     WINDOWS.forEach((w, i) => out.push({ i, H: w[0], end: w[1], dl: w[1] + w[2], from: w[0], to: i + 1 < WINDOWS.length ? WINDOWS[i + 1][0] : CUT_MIN, label: "Ronda " + (i + 1) }));
     return out;
   }
-  for (let H = OPEN_MIN, i = 0; H < CUT_MIN; H += r.every, i++) {
-    out.push({ i, H, dl: H + TOL, from: i === 0 ? Math.max(DAY_START, H - r.every + TOL) : H - r.every + TOL, to: Math.min(H + r.every, CUT_MIN), label: fmtMin(H) });
+  /* Sin inicio no hay horarios: la rutina cuenta desde que alguien la inicia (o desde la hora programada). */
+  if (ini == null) return out;
+  for (let H = ini + r.every, i = 0; H < CUT_MIN; H += r.every, i++) {
+    out.push({ i, H, dl: H + TOL, from: i === 0 ? ini : H - r.every + TOL, to: Math.min(H + r.every, CUT_MIN), label: fmtMin(H) });
   }
   return out;
 }
@@ -155,9 +157,9 @@ export function assign(sch, ms) {
    items: registros [{m, id, anulado, rep_de, rep_at_m}] (o solo minutos).
    Un registro anulado ("Repetir, por favor") deja su horario pendiente REP_MIN minutos;
    la repetición lo cubre pero siempre cuenta como tarde. */
-export function analyze(r, itemsIn, now) {
+export function analyze(r, itemsIn, now, ini) {
   const items = itemsIn.map((x) => (typeof x === "number" ? { m: x } : x));
-  const sch = schedule(r);
+  const sch = schedule(r, ini);
   const normalIx = []; items.forEach((it, i) => { if (!it.rep_de) normalIx.push(i); });
   const as = assign(sch, normalIx.map((i) => items[i].m));
   const filled = as.filled.map((f) => (f ? { ...f, ix: normalIx[f.ix] } : null));
@@ -188,7 +190,8 @@ export function analyze(r, itemsIn, now) {
     return out;
   }
   const p = sch.findIndex((s, i) => !filled[i] && !repPend[i] && s.to > now);
-  const firstStart = r.win ? WINDOWS[0][0] : OPEN_MIN;
+  const firstStart = WINDOWS[0][0];
+  if (!r.win && ini == null && now < CUT_MIN) { out.state = "off"; out.rank = 4; out.text = "La rutina aún no inicia"; out.noIni = true; return out; }
   if (now >= CUT_MIN) { out.state = "off"; out.rank = 4; out.text = "Fuera de horario · todo en orden"; return out; }
   if (p < 0) { out.state = "green"; out.rank = 2; out.fill = 1; out.text = r.win ? (out.ok + out.late) + " de 3 rondas hechas" : "Al día hasta las 11:30 p.m."; return out; }
   const s = sch[p]; out.next = s;
@@ -202,7 +205,6 @@ export function analyze(r, itemsIn, now) {
     } else { out.state = "red"; out.rank = 0; out.left = s.dl - now; out.fill = 1; out.text = s.label + " atrasada " + durTxt(now - s.end); }
     return out;
   }
-  if (now < OPEN_MIN - 10) { out.state = "off"; out.rank = 4; out.text = "Empieza a las 11:00 a.m."; return out; }
   const start = p > 0 ? sch[p - 1].H : s.H - r.every;
   if (now > s.dl) { out.state = "red"; out.rank = 0; out.left = s.dl - now; out.fill = 1; out.text = "Atrasado " + durTxt(now - s.H) + " · tocaba " + fmtMin(s.H); }
   else if (now >= s.H - 10) { out.state = "yellow"; out.rank = 1; out.left = s.dl - now; out.fill = Math.min(1, Math.max(0.85, (now - start) / (s.H - start))); out.text = now < s.H ? "Toca a las " + fmtMin(s.H) + " · en " + durTxt(s.H - now) : "Ya toca · hasta " + fmtMin(s.dl); }
@@ -215,11 +217,11 @@ export function rutByTask(docs) {
   Object.values(g).forEach((a) => a.sort((x, y) => (x.at < y.at ? -1 : 1)));
   return g;
 }
-export function rutAll(docs, j, now) {
+export function rutAll(docs, j, now, ini) {
   const g = rutByTask(docs);
   return RUTINA.map((r, idx) => {
     const items = g[r.id].map((d) => ({ m: minOf(d.at, j), id: d.id, anulado: !!d.anulado, rep_de: d.rep_de || null, rep_at_m: d.rep_at ? minOf(d.rep_at, j) : null }));
-    const a = analyze(r, items, now); a.idx = idx; a.docs = g[r.id]; return a;
+    const a = analyze(r, items, now, ini); a.idx = idx; a.docs = g[r.id]; return a;
   });
 }
 export function dayStats(all) {
@@ -249,9 +251,10 @@ export function resumenEntrega(e) {
   if (e.nota_general) head.push("💬 " + e.nota_general + (e.nota_por ? " — " + e.nota_por : ""));
   return head.concat([""], rows).join("\n");
 }
-export function resumenRutina(j, docs, isToday) {
-  const now = isToday ? nowMinFor(j) : null, all = rutAll(docs, j, now), st = dayStats(all);
+export function resumenRutina(j, docs, isToday, ini) {
+  const now = isToday ? nowMinFor(j) : null, all = rutAll(docs, j, now, ini), st = dayStats(all);
   const lines = ["*Checklist de rutina*", "Bee's Pizza Sullivan", "📅 " + fechaLarga(j) + (isToday ? " · corte " + horaIso(new Date().toISOString()) : ""),
+    ini == null ? "▶️ La rutina no se inició" : "▶️ Inició " + fmtMin(ini),
     "📋 " + (st.pct == null ? "Sin horarios vencidos aún" : st.pct + "% a tiempo") + " · ✅ " + st.ok + " · ⚠️ " + st.late + " tarde · ❌ " + st.missed + " sin hacer"];
   const cr = califRutina(docs.filter((d) => !d.anulado || d.nota));
   const reps = docs.filter((d) => d.anulado).length;
@@ -272,4 +275,50 @@ export function resumenRutina(j, docs, isToday) {
     lines.push("");
   });
   return lines.join("\n").trim();
+}
+
+/* ---------- Inicio de rutina ---------- */
+export const DIAS_SEM = ["Domingo", "Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado"];
+export function diaSem(j) { const [y, m, d] = j.split("-").map(Number); return new Date(Date.UTC(y, m - 1, d)).getUTCDay(); }
+export function hhmmToMin(t) { const m = /^(\d{1,2}):(\d{2})$/.exec(t || ""); return m ? +m[1] * 60 + +m[2] : null; }
+/* Minuto de inicio de una jornada: el que alguien marcó, o el programado si ya pasó. null = aún no inicia. */
+export function inicioDe(j, fila, horario, now) {
+  if (fila && fila.inicio) return Math.round(minOf(fila.inicio, j));
+  const prog = hhmmToMin(horario && horario[String(diaSem(j))]);
+  if (prog == null) return null;
+  return now == null || now >= prog ? prog : null;
+}
+
+/* ---------- Ánimo: racha y semana ---------- */
+export function lunesDe(j) { const d = diaSem(j); return addDays(j, -((d + 6) % 7)); }
+/* Por persona: a tiempo, tarde, repetidas y calificaciones de un día de rutina. */
+export function porPersonaDia(docs, j, now, ini) {
+  const out = {};
+  const P = (d) => (out[d.emp_id] = out[d.emp_id] || { nombre: d.nombre, ok: 0, late: 0, rep: 0, notas: [] });
+  rutAll(docs, j, now, ini).forEach((a) => {
+    a.filled.forEach((f) => { if (!f) return; const d = a.docs[f.ix]; if (!d.emp_id) return; const p = P(d); if (f.rep || f.late) p.late++; else p.ok++; });
+    a.docs.forEach((d) => { if (!d.emp_id) return; const p = P(d); if (d.anulado) p.rep++; if (d.nota) p.notas.push(d.nota); });
+  });
+  return out;
+}
+const NPTS = { 4: 2, 3: 1, 2: 0, 1: -1 };
+/* Puntos de la semana: a tiempo +3, tarde +1, repetir -2, calificación 🟢+2 🟡+1 🟠0 🔴-1, entrega completa +5 y su calificación general ×2. */
+export function puntosSemana(dias, entregas) {
+  const t = {};
+  const P = (id, nombre) => (t[id] = t[id] || { id, nombre, pts: 0, ok: 0, late: 0, rep: 0, ent: 0, notas: [] });
+  dias.forEach((pp) => Object.entries(pp).forEach(([id, x]) => { const p = P(id, x.nombre); p.ok += x.ok; p.late += x.late; p.rep += x.rep; p.notas.push(...x.notas); }));
+  (entregas || []).forEach((e) => { if (!e.emp_id || e.estado !== "entregado") return; const p = P(e.emp_id, e.nombre); p.ent++; p.pts += 5; const c = califEntrega(e); if (c.nota) p.pts += NPTS[c.nota] * 2; });
+  Object.values(t).forEach((p) => { p.pts += p.ok * 3 + p.late - p.rep * 2 + p.notas.reduce((a, n) => a + NPTS[n], 0); const c = p.notas.length ? p.notas.reduce((a, b) => a + b, 0) / p.notas.length : null; p.nota = notaDe(c); delete p.notas; });
+  return Object.values(t).sort((a, b) => b.pts - a.pts || b.ok - a.ok);
+}
+/* Racha: días seguidos (hacia atrás) en que la persona registró rutina sin tardes ni repeticiones. Los días sin registros no cuentan ni la rompen. */
+export function rachaDe(empId, diasDesc) {
+  let n = 0;
+  for (const pp of diasDesc) {
+    const x = pp[empId];
+    if (!x || x.ok + x.late + x.rep === 0) continue;
+    if (x.late || x.rep) break;
+    n++;
+  }
+  return n;
 }

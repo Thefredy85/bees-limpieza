@@ -39,7 +39,9 @@ async function getSession(token?: string) {
   const { data } = await sb.from("sesiones").select("token,rol,emp_id,expira,empleados(id,nombre,areas,turnos,ver)").eq("token", token).maybeSingle();
   if (!data || new Date(data.expira) < new Date()) throw new HttpErr(401, "Tu sesión terminó. Vuelve a marcar tu clave.");
   const emp: any = (data as any).empleados || null;
-  return { token: data.token, rol: data.rol as "emp" | "admin", emp, jefe: data.rol === "admin" || !!emp?.ver, admin: data.rol === "admin" };
+  let nombre = emp?.nombre || "";
+  if (data.rol === "admin") { const { data: a } = await sb.from("admin_cfg").select("nombre").eq("id", 1).maybeSingle(); nombre = a?.nombre || "Administrador"; }
+  return { token: data.token, rol: data.rol as "emp" | "admin", emp, nombre, jefe: data.rol === "admin" || !!emp?.ver, admin: data.rol === "admin" };
 }
 async function newSession(rol: "emp" | "admin", empId: string | null) {
   const expira = new Date(Date.now() + SESSION_HOURS * 3600e3).toISOString();
@@ -79,14 +81,17 @@ async function signed(paths: string[]) {
 const entregaFotos = (e: any) => Object.values(e?.fotos || {}) as string[];
 
 /* ---------- Notificaciones push ---------- */
-async function notify(target: "jefes" | "todos", payload: { title: string; body: string; tag?: string; url?: string }) {
+async function notify(target: "jefes" | "todos" | "equipo", payload: { title: string; body: string; tag?: string; url?: string }) {
   const s = await secrets();
   if (!s.vapid_public || !s.vapid_private) return;
   webpush.setVapidDetails("mailto:avisos@beespizza.app", s.vapid_public, s.vapid_private);
-  let q = sb.from("push_subs").select("endpoint,p256dh,auth,jefe");
+  let q = sb.from("push_subs").select("endpoint,p256dh,auth,jefe,dnd_ini,dnd_fin,pend");
   if (target === "jefes") q = q.eq("jefe", true);
+  if (target === "equipo") q = q.eq("rol", "emp");
   const { data } = await q;
+  const cm = relojMin();
   await Promise.all((data || []).map(async (sub: any) => {
+    if (enDnd(sub, cm)) { await sb.from("push_subs").update({ pend: (sub.pend || 0) + 1 }).eq("endpoint", sub.endpoint); return; }
     try {
       await webpush.sendNotification({ endpoint: sub.endpoint, keys: { p256dh: sub.p256dh, auth: sub.auth } }, JSON.stringify(payload), { TTL: 3600, urgency: "high" });
     } catch (e: any) {
@@ -99,13 +104,32 @@ async function notifyEmp(empId: string | null, payload: { title: string; body: s
   if (!empId) return;
   const s = await secrets();
   webpush.setVapidDetails("mailto:avisos@beespizza.app", s.vapid_public, s.vapid_private);
-  const { data } = await sb.from("push_subs").select("endpoint,p256dh,auth").eq("emp_id", empId);
+  const { data } = await sb.from("push_subs").select("endpoint,p256dh,auth,dnd_ini,dnd_fin,pend").eq("emp_id", empId);
+  const cm = relojMin();
   await Promise.all((data || []).map(async (sub: any) => {
+    if (enDnd(sub, cm)) { await sb.from("push_subs").update({ pend: (sub.pend || 0) + 1 }).eq("endpoint", sub.endpoint); return; }
     try { await webpush.sendNotification({ endpoint: sub.endpoint, keys: { p256dh: sub.p256dh, auth: sub.auth } }, JSON.stringify(payload), { TTL: 3600, urgency: "high" }); }
     catch (e: any) { if (e?.statusCode === 404 || e?.statusCode === 410) await sb.from("push_subs").delete().eq("endpoint", sub.endpoint); }
   }));
 }
-const quien = (ses: any) => ses.emp?.nombre || "Administrador";
+const quien = (ses: any) => ses.nombre || ses.emp?.nombre || "Administrador";
+const relojMin = () => { const d = S.mxDate(Date.now()); return d.getUTCHours() * 60 + d.getUTCMinutes(); };
+const enDnd = (sub: any, cm: number) => sub.dnd_ini != null && sub.dnd_fin != null && sub.dnd_ini !== sub.dnd_fin && (sub.dnd_ini < sub.dnd_fin ? cm >= sub.dnd_ini && cm < sub.dnd_fin : cm >= sub.dnd_ini || cm < sub.dnd_fin);
+async function horarioCfg() { const { data } = await sb.from("config").select("valor").eq("clave", "horario").maybeSingle(); return (data?.valor || {}) as Record<string, string | null>; }
+/* Inicio de rutina de una jornada: {m, por, auto, at} o null si aún no inicia. */
+async function inicioInfo(j: string, now: number | null, horario?: any) {
+  const [{ data: fila }, hor] = await Promise.all([sb.from("jornadas").select("*").eq("fecha", j).maybeSingle(), horario ? Promise.resolve(horario) : horarioCfg()]);
+  const m = S.inicioDe(j, fila, hor, now);
+  if (m == null) return { m: null, prog: S.hhmmToMin(hor[String(S.diaSem(j))]), horario: hor };
+  return { m, por: fila?.por || "Programada", auto: fila ? !!fila.auto : true, prog: S.hhmmToMin(hor[String(S.diaSem(j))]), horario: hor };
+}
+async function iniciosRango(desde: string, hasta: string, hor: any, nowHoy: number) {
+  const { data } = await sb.from("jornadas").select("fecha,inicio").gte("fecha", desde).lte("fecha", hasta);
+  const filas = Object.fromEntries((data || []).map((x: any) => [x.fecha, x]));
+  const out: Record<string, number | null> = {};
+  for (let j = hasta; j >= desde; j = S.addDays(j, -1)) out[j] = S.inicioDe(j, filas[j], hor, j === hasta ? nowHoy : null);
+  return out;
+}
 const RUT_COLS = "id,fecha,task_id,emp_id,nombre,at,foto,nota,coment,cal_por,cal_at,anulado,rep_txt,rep_por,rep_at,rep_para,rep_de";
 const itemsDe = (rows: any[], j: string) => rows.map((d) => ({ m: S.minOf(d.at, j), id: d.id, anulado: !!d.anulado, rep_de: d.rep_de || null, rep_at_m: d.rep_at ? S.minOf(d.rep_at, j) : null }));
 /* Repeticiones de rutina pedidas hoy que nadie ha cubierto todavía. */
@@ -117,6 +141,19 @@ async function repPendientes(j: string, taskId?: string) {
   const { data: hechas } = await sb.from("rutina").select("rep_de").in("rep_de", anul.map((a: any) => a.id));
   const cubiertas = new Set((hechas || []).map((h: any) => h.rep_de));
   return anul.filter((a: any) => !cubiertas.has(a.id)).sort((a: any, b: any) => (a.rep_at < b.rep_at ? -1 : 1));
+}
+
+async function retrosNuevas(empId: string) {
+  const desde = S.addDays(S.jornadaOf(Date.now()), -13);
+  const [{ data: e }, { data: rut }, { data: ent }] = await Promise.all([
+    sb.from("empleados").select("retro_visto").eq("id", empId).maybeSingle(),
+    sb.from("rutina").select("cal_at,rep_at").eq("emp_id", empId).gte("fecha", desde).or("nota.not.is.null,coment.not.is.null,anulado.eq.true"),
+    sb.from("entregas").select("calif,nota_at").eq("emp_id", empId).gte("fecha", desde),
+  ]);
+  const v = e?.retro_visto || "";
+  let n = (rut || []).filter((r: any) => (r.cal_at || "") > v || (r.rep_at || "") > v).length;
+  (ent || []).forEach((x: any) => { if ((x.nota_at || "") > v) n++; Object.values(x.calif || {}).forEach((c: any) => { if (c && (c.at || "") > v) n++; }); });
+  return n;
 }
 
 /* ---------- Acciones ---------- */
@@ -142,9 +179,9 @@ const handlers: Record<string, (b: Body, req: Request) => Promise<unknown>> = {
     const { data: emp } = await sb.from("empleados").select("id,nombre,areas,turnos,ver").eq("pin_hash", h).maybeSingle();
     const s = await secrets();
     const ok = async () => { if (intento) await sb.from("login_fallos").delete().eq("id", intento.id); };
-    if (emp) { await ok(); return { token: await newSession("emp", emp.id), rol: "emp", emp: publicEmp(emp), jefe: !!emp.ver, admin: false, vapid: s.vapid_public }; }
+    if (emp) { await ok(); return { token: await newSession("emp", emp.id), rol: "emp", emp: publicEmp(emp), nombre: emp.nombre, jefe: !!emp.ver, admin: false, vapid: s.vapid_public }; }
     const { data: adm } = await sb.from("admin_cfg").select("pin_hash").eq("id", 1).maybeSingle();
-    if (adm && adm.pin_hash === h) { await ok(); return { token: await newSession("admin", null), rol: "admin", emp: null, jefe: true, admin: true, vapid: s.vapid_public }; }
+    if (adm && adm.pin_hash === h) { await ok(); const { data: an } = await sb.from("admin_cfg").select("nombre").eq("id", 1).maybeSingle(); return { token: await newSession("admin", null), rol: "admin", emp: null, nombre: an?.nombre || "Administrador", jefe: true, admin: true, vapid: s.vapid_public }; }
     await sb.from("login_fallos").delete().lt("ts", new Date(Date.now() - 86400e3).toISOString());
     throw new HttpErr(401, "Clave incorrecta");
   },
@@ -155,17 +192,19 @@ const handlers: Record<string, (b: Body, req: Request) => Promise<unknown>> = {
     const s = await secrets();
     if (String(b.code || "").trim().toUpperCase() !== s.setup) throw new HttpErr(403, "Código de configuración incorrecto.");
     if (!isPin(b.pin)) throw new HttpErr(400, "El PIN debe tener 4 números.");
+    const nombre = String(b.nombre || "").trim().slice(0, 30);
+    if (!nombre) throw new HttpErr(400, "Escribe tu nombre.");
     const h = await hashPin(b.pin);
     const { data: clash } = await sb.from("empleados").select("id").eq("pin_hash", h).maybeSingle();
     if (clash) throw new HttpErr(409, "Esa clave ya la usa un empleado.");
-    const { error } = await sb.from("admin_cfg").insert({ id: 1, pin_hash: h });
+    const { error } = await sb.from("admin_cfg").insert({ id: 1, pin_hash: h, nombre });
     if (error) throw error;
-    return { token: await newSession("admin", null), rol: "admin", emp: null, jefe: true, admin: true, vapid: s.vapid_public };
+    return { token: await newSession("admin", null), rol: "admin", emp: null, nombre, jefe: true, admin: true, vapid: s.vapid_public };
   },
 
   async logout(b) { if (b.token) await sb.from("sesiones").delete().eq("token", b.token); return { ok: true }; },
 
-  async yo(b) { const ses = await getSession(b.token); return { rol: ses.rol, emp: publicEmp(ses.emp), jefe: ses.jefe, admin: ses.admin, vapid: (await secrets()).vapid_public }; },
+  async yo(b) { const ses = await getSession(b.token); return { rol: ses.rol, emp: publicEmp(ses.emp), nombre: ses.nombre, jefe: ses.jefe, admin: ses.admin, vapid: (await secrets()).vapid_public }; },
 
   async hoy(b) {
     const ses = await getSession(b.token);
@@ -177,7 +216,8 @@ const handlers: Record<string, (b: Body, req: Request) => Promise<unknown>> = {
     const mine = (rut || []).filter((r: any) => ses.emp && r.emp_id === ses.emp.id).map((r: any) => r.foto);
     const myEnt = (ent || []).filter((e: any) => ses.emp && e.emp_id === ses.emp.id).flatMap(entregaFotos);
     const { data: eq } = await sb.from("empleados").select("id,nombre");
-    return { fecha: j, ahora: Date.now(), entregas: ent || [], rutina: rut || [], urls: await signed([...mine, ...myEnt]), emp: publicEmp(ses.emp), equipo: Object.fromEntries((eq || []).map((x: any) => [x.id, x.nombre])) };
+    const ini = await inicioInfo(j, S.nowMinFor(j));
+    return { fecha: j, ahora: Date.now(), entregas: ent || [], rutina: rut || [], urls: await signed(ses.jefe ? [...(rut || []).map((r: any) => r.foto), ...(ent || []).flatMap(entregaFotos)] : [...mine, ...myEnt]), emp: publicEmp(ses.emp), nombre: ses.nombre, equipo: Object.fromEntries((eq || []).map((x: any) => [x.id, x.nombre])), inicio: ini, retros_nuevas: ses.emp ? await retrosNuevas(ses.emp.id) : 0 };
   },
 
   async entrega_iniciar(b) {
@@ -253,6 +293,8 @@ const handlers: Record<string, (b: Body, req: Request) => Promise<unknown>> = {
     const r = S.RUTINA.find((x: any) => x.id === b.task_id);
     if (!r) throw new HttpErr(400, "Tarea no válida.");
     const j = S.jornadaOf(Date.now());
+    const ini = await inicioInfo(j, S.nowMinFor(j));
+    if (!r.win && ini.m == null) throw new HttpErr(409, "La rutina aún no inicia. Pídele a tu supervisor que la inicie.");
     // ¿Hay una repetición pendiente de esta tarea? Si se le pidió a otra persona, solo ella puede cubrirla dentro de los 20 minutos.
     const pend = await repPendientes(j, r.id);
     let repDe: any = null;
@@ -269,7 +311,7 @@ const handlers: Record<string, (b: Body, req: Request) => Promise<unknown>> = {
     const { data, error } = await sb.from("rutina").insert({ fecha: j, task_id: r.id, emp_id: ses.emp.id, nombre: ses.emp.nombre, at, foto: path, rep_de: repDe?.id || null }).select(RUT_COLS).single();
     if (error) { await removeFotos([path]); throw error; }
     const { data: hoy } = await sb.from("rutina").select(RUT_COLS).eq("fecha", j).eq("task_id", r.id).order("at");
-    const a = S.analyze(r, itemsDe(hoy || [], j), S.nowMinFor(j));
+    const a = S.analyze(r, itemsDe(hoy || [], j), S.nowMinFor(j), ini.m);
     const ix = (hoy || []).findIndex((d: any) => d.id === data.id);
     const f = a.filled.find((x: any) => x && x.ix === ix);
     const estado = repDe ? "repetida (cuenta como tarde)" : f ? (f.late ? "tarde " + S.durTxt(f.late) : "a tiempo") : "extra";
@@ -304,7 +346,8 @@ const handlers: Record<string, (b: Body, req: Request) => Promise<unknown>> = {
     if (d.rep_de) throw new HttpErr(409, "Este registro ya es una repetición. Califícalo con su nota.");
     const rDef = S.RUTINA.find((x: any) => x.id === d.task_id);
     const { data: delDia } = await sb.from("rutina").select(RUT_COLS).eq("fecha", d.fecha).eq("task_id", d.task_id).order("at");
-    const an = S.analyze(rDef, itemsDe(delDia || [], d.fecha), S.nowMinFor(d.fecha));
+    const iniD = await inicioInfo(d.fecha, S.nowMinFor(d.fecha));
+    const an = S.analyze(rDef, itemsDe(delDia || [], d.fecha), S.nowMinFor(d.fecha), iniD.m);
     const ixD = (delDia || []).findIndex((x: any) => x.id === d.id);
     if (!an.filled.some((f: any) => f && f.ix === ixD)) throw new HttpErr(409, "Este registro fue fuera de horario y no cuenta para ninguno; no hace falta repetirlo. Califícalo con su nota.");
     const txt = String(b.txt || "").trim().slice(0, 200);
@@ -382,7 +425,120 @@ const handlers: Record<string, (b: Body, req: Request) => Promise<unknown>> = {
     ]);
     const paths = [...(rut || []).map((r: any) => r.foto), ...(ent || []).flatMap(entregaFotos)];
     const { data: eq } = await sb.from("empleados").select("id,nombre");
-    return { fecha, hoy: hoyJ, ahora: Date.now(), entregas: ent || [], rutina: rut || [], rango: rango || [], urls: await signed(paths), equipo: Object.fromEntries((eq || []).map((x: any) => [x.id, x.nombre])) };
+    const hor = await horarioCfg();
+    const inicios = await iniciosRango(fecha < desde ? fecha : desde, hoyJ, hor, S.nowMinFor(hoyJ));
+    const ini = await inicioInfo(fecha, fecha === hoyJ ? S.nowMinFor(hoyJ) : null, hor);
+    return { fecha, hoy: hoyJ, ahora: Date.now(), entregas: ent || [], rutina: rut || [], rango: rango || [], inicios, inicio: ini, urls: await signed(paths), nombre: ses.nombre, equipo: Object.fromEntries((eq || []).map((x: any) => [x.id, x.nombre])) };
+  },
+
+  async rutina_iniciar(b) {
+    const ses = await getSession(b.token);
+    if (!ses.jefe) throw new HttpErr(403, "Solo supervisores y administrador inician la rutina.");
+    const j = S.jornadaOf(Date.now()), now = S.nowMinFor(j);
+    if (now >= S.CUT_MIN - 30) throw new HttpErr(409, "Ya es muy tarde para iniciar la rutina de hoy.");
+    const ini = await inicioInfo(j, now);
+    if (ini.m != null) throw new HttpErr(409, "La rutina ya inició a las " + S.fmtMin(ini.m) + (ini.por ? " (" + ini.por + ")" : "") + ".");
+    const at = new Date().toISOString();
+    const { error } = await sb.from("jornadas").insert({ fecha: j, inicio: at, por: quien(ses), auto: false });
+    if (error) throw new HttpErr(409, "La rutina ya se inició.");
+    const m = Math.round(S.minOf(at, j));
+    await notify("todos", { title: "▶️ Rutina iniciada por " + quien(ses), body: "Desde las " + S.fmtMin(m) + ". Las primeras tareas tocan a las " + S.fmtMin(m + 60) + ".", tag: "inicio-" + j });
+    return { inicio: await inicioInfo(j, S.nowMinFor(j)) };
+  },
+
+  async horario_guardar(b) {
+    const ses = await getSession(b.token);
+    if (!ses.admin) throw new HttpErr(403, "Solo el administrador cambia el horario.");
+    const out: Record<string, string | null> = {};
+    for (let d = 0; d < 7; d++) {
+      const v = b.horario?.[String(d)];
+      if (v == null || v === "") { out[String(d)] = null; continue; }
+      const m = S.hhmmToMin(String(v));
+      if (m == null || m < 7 * 60 || m > 22 * 60) throw new HttpErr(400, "La hora de inicio debe estar entre 7:00 a.m. y 10:00 p.m.");
+      out[String(d)] = String(Math.floor(m / 60)).padStart(2, "0") + ":" + String(m % 60).padStart(2, "0");
+    }
+    await sb.from("config").upsert({ clave: "horario", valor: out });
+    return { horario: out };
+  },
+
+  async mi_nombre(b) {
+    const ses = await getSession(b.token);
+    if (!ses.admin) throw new HttpErr(403, "Solo el administrador.");
+    const nombre = String(b.nombre || "").trim().slice(0, 30);
+    if (!nombre) throw new HttpErr(400, "Escribe tu nombre.");
+    await sb.from("admin_cfg").update({ nombre }).eq("id", 1);
+    return { nombre };
+  },
+
+  async mi_clave(b, req) {
+    const ses = await getSession(b.token);
+    const ip = (req.headers.get("x-forwarded-for") || "?").split(",")[0].trim();
+    if (!isPin(b.actual) || !isPin(b.nueva)) throw new HttpErr(400, "Las claves son de 4 números.");
+    const { data: intento } = await sb.from("login_fallos").insert({ ip }).select("id").single();
+    const { count } = await sb.from("login_fallos").select("id", { count: "exact", head: true }).eq("ip", ip).gte("ts", new Date(Date.now() - 10 * 60e3).toISOString());
+    if ((count || 0) > MAX_FAILS) throw new HttpErr(429, "Demasiados intentos. Espera 10 minutos.");
+    const hA = await hashPin(b.actual), hN = await hashPin(b.nueva);
+    const { data: adm } = await sb.from("admin_cfg").select("pin_hash").eq("id", 1).maybeSingle();
+    let actualOk = false;
+    if (ses.admin) actualOk = adm?.pin_hash === hA;
+    else { const { data: e } = await sb.from("empleados").select("pin_hash").eq("id", ses.emp.id).maybeSingle(); actualOk = e?.pin_hash === hA; }
+    if (!actualOk) throw new HttpErr(403, "Tu clave actual no es correcta.");
+    if (intento) await sb.from("login_fallos").delete().eq("id", intento.id);
+    if (b.actual === b.nueva) throw new HttpErr(400, "La clave nueva debe ser distinta a la actual.");
+    const { data: clash } = await sb.from("empleados").select("id").eq("pin_hash", hN).maybeSingle();
+    if ((clash && clash.id !== ses.emp?.id) || (!ses.admin && adm?.pin_hash === hN)) throw new HttpErr(409, "Esa clave no está disponible. Elige otra.");
+    if (ses.admin) await sb.from("admin_cfg").update({ pin_hash: hN }).eq("id", 1);
+    else await sb.from("empleados").update({ pin_hash: hN }).eq("id", ses.emp.id);
+    return { ok: true };
+  },
+
+  async push_dnd(b) {
+    await getSession(b.token);
+    const ok = (v: any) => v == null || (Number.isInteger(v) && v >= 0 && v < 1440);
+    if (!b.endpoint || !ok(b.ini) || !ok(b.fin)) throw new HttpErr(400, "Horario no válido.");
+    const { data } = await sb.from("push_subs").update({ dnd_ini: b.ini ?? null, dnd_fin: b.fin ?? null }).eq("endpoint", b.endpoint).select("endpoint");
+    if (!data?.length) throw new HttpErr(404, "Primero activa los avisos en este celular.");
+    return { ok: true };
+  },
+
+  async mis_retros(b) {
+    const ses = await getSession(b.token);
+    if (!ses.emp) return { rutina: [], entregas: [], urls: {}, visto: null };
+    const desde = S.addDays(S.jornadaOf(Date.now()), -13);
+    const [{ data: rut }, { data: ent }, { data: e }] = await Promise.all([
+      sb.from("rutina").select(RUT_COLS).eq("emp_id", ses.emp.id).gte("fecha", desde).or("nota.not.is.null,coment.not.is.null,anulado.eq.true").order("at", { ascending: false }),
+      sb.from("entregas").select("*").eq("emp_id", ses.emp.id).gte("fecha", desde).order("inicio", { ascending: false }),
+      sb.from("empleados").select("retro_visto").eq("id", ses.emp.id).maybeSingle(),
+    ]);
+    const paths = [...(rut || []).map((r: any) => r.foto), ...(ent || []).flatMap((x: any) => Object.entries(x.fotos || {}).filter(([k]) => x.calif?.[k]?.c || x.repetir?.[k]).map(([, p]) => p as string))];
+    return { rutina: rut || [], entregas: ent || [], urls: await signed(paths), visto: e?.retro_visto || null };
+  },
+
+  async retros_visto(b) {
+    const ses = await getSession(b.token);
+    if (ses.emp) await sb.from("empleados").update({ retro_visto: new Date().toISOString() }).eq("id", ses.emp.id);
+    return { ok: true };
+  },
+
+  async animo(b) {
+    const ses = await getSession(b.token);
+    const hoyJ = S.jornadaOf(Date.now()), lunes = S.lunesDe(hoyJ), lunesAnt = S.addDays(lunes, -7), desde = S.addDays(hoyJ, -30);
+    const [{ data: rut }, { data: ent }, hor] = await Promise.all([
+      sb.from("rutina").select("id,fecha,task_id,emp_id,nombre,at,nota,anulado,rep_de,rep_at").gte("fecha", desde < lunesAnt ? desde : lunesAnt),
+      sb.from("entregas").select("fecha,emp_id,nombre,estado,area,turno,fotos,calif").gte("fecha", lunesAnt),
+      horarioCfg(),
+    ]);
+    const inis = await iniciosRango(desde < lunesAnt ? desde : lunesAnt, hoyJ, hor, S.nowMinFor(hoyJ));
+    const porDia: Record<string, any[]> = {};
+    (rut || []).forEach((d: any) => (porDia[d.fecha] = porDia[d.fecha] || []).push(d));
+    const dias: Record<string, any> = {};
+    Object.keys(inis).forEach((j) => { const docs = (porDia[j] || []).sort((a: any, c: any) => (a.at < c.at ? -1 : 1)); dias[j] = S.porPersonaDia(docs, j, j === hoyJ ? S.nowMinFor(j) : null, inis[j]); });
+    const rango = (a: string, z: string) => Object.keys(dias).filter((j) => j >= a && j <= z);
+    const semana = S.puntosSemana(rango(lunes, hoyJ).map((j) => dias[j]), (ent || []).filter((e: any) => e.fecha >= lunes));
+    const pasada = S.puntosSemana(rango(lunesAnt, S.addDays(lunes, -1)).map((j) => dias[j]), (ent || []).filter((e: any) => e.fecha >= lunesAnt && e.fecha < lunes));
+    const desc = Object.keys(dias).sort().reverse().map((j) => dias[j]);
+    const corto = (p: any) => ({ nombre: p.nombre, pts: p.pts, nota: p.nota });
+    return { racha: ses.emp ? S.rachaDe(ses.emp.id, desc) : null, podio: semana.slice(0, 3).map(corto), ganador: pasada[0] && pasada[0].pts > 0 ? corto(pasada[0]) : null, semana_desde: lunes, tabla: ses.jefe ? semana : undefined };
   },
 
   async rutina_borrar(b) {
@@ -490,10 +646,25 @@ const handlers: Record<string, (b: Body, req: Request) => Promise<unknown>> = {
     const s = await secrets();
     if (req.headers.get("x-cron-key") !== s.cron) throw new HttpErr(403, "No autorizado.");
     const j = S.jornadaOf(Date.now()), now = S.nowMinFor(j);
-    if (now < S.OPEN_MIN - 120 || now >= S.CUT_MIN) return { ok: true, fuera: true };
-    const { data: rut } = await sb.from("rutina").select(RUT_COLS).eq("fecha", j);
-    const all = S.rutAll(rut || [], j, now);
     let enviados = 0;
+    // Resumen para quien sale de "No molestar" con avisos pendientes.
+    const cm = relojMin();
+    const { data: pend } = await sb.from("push_subs").select("*").gt("pend", 0);
+    webpush.setVapidDetails("mailto:avisos@beespizza.app", s.vapid_public, s.vapid_private);
+    for (const sub of pend || []) {
+      if (enDnd(sub, cm)) continue;
+      await sb.from("push_subs").update({ pend: 0 }).eq("endpoint", sub.endpoint);
+      try { await webpush.sendNotification({ endpoint: sub.endpoint, keys: { p256dh: sub.p256dh, auth: sub.auth } }, JSON.stringify({ title: "🔕 Terminó tu No molestar", body: "Llegaron " + sub.pend + " aviso" + (sub.pend > 1 ? "s" : "") + " mientras tanto. Ábrela para ver cómo va el día.", tag: "dnd" }), { TTL: 3600 }); enviados++; } catch {}
+    }
+    if (now < 420 || now >= S.CUT_MIN) return { ok: true, fuera: true, enviados };
+    // Inicio programado: se marca una sola vez y se avisa a todos.
+    const ini = await inicioInfo(j, now);
+    if (ini.m != null && ini.auto) {
+      const { error } = await sb.from("jornadas").insert({ fecha: j, inicio: new Date(S.jMidnightMs(j) + ini.m * 60e3).toISOString(), por: "Programada", auto: true });
+      if (!error) { enviados++; await notify("todos", { title: "▶️ Rutina iniciada", body: "Inició a la hora programada, " + S.fmtMin(ini.m) + ". Las primeras tareas tocan a las " + S.fmtMin(ini.m + 60) + ".", tag: "inicio-" + j }); }
+    }
+    const { data: rut } = await sb.from("rutina").select(RUT_COLS).eq("fecha", j);
+    const all = S.rutAll(rut || [], j, now, ini.m);
     // Repeticiones pedidas a una persona que vencieron: se abren a todo el turno (un solo aviso).
     for (const p of await repPendientes(j)) {
       if (!p.rep_para || Date.now() <= Date.parse(p.rep_at) + S.REP_MIN * 60e3) continue;
@@ -509,7 +680,8 @@ const handlers: Record<string, (b: Body, req: Request) => Promise<unknown>> = {
       const { error } = await sb.from("avisos").insert({ clave });
       if (error) continue; // ya avisado
       enviados++;
-      await notify("todos", { title: "⏰ " + a.r.t + " atrasado", body: a.text, tag: "atraso-" + a.r.id });
+      // Exterior: por ahora solo al equipo (no al administrador).
+      await notify(a.r.win ? "equipo" : "todos", { title: "⏰ " + a.r.t + " atrasado", body: a.text, tag: "atraso-" + a.r.id });
     }
     await sb.from("avisos").delete().lt("creado", new Date(Date.now() - 3 * 86400e3).toISOString());
     return { ok: true, enviados };
