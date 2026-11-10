@@ -444,11 +444,12 @@ function setupSheet() {
 }
 
 /* ---------- Encabezado y pestañas ---------- */
-const haceTareas = () => !!st.me?.emp?.areas?.length;
+/* Toman fotos: colaboradores con área y todos los supervisores. El administrador solo ve y califica. */
+const haceTareas = () => !!st.me?.emp && (!!st.me.emp.ver || !!st.me.emp.areas?.length);
 function tabsFor() {
   const P = ["panel", "Panel", I.grid], R = ["rutina", "Rutina", I.list], E = ["entregas", "Entregas", I.moon], M = ["midia", "Mi día", I.cal], G = ["registros", "Registros", I.chart], Q = ["empleados", "Equipo", I.users];
   if (st.me.admin) return [P, R, G, Q];
-  if (st.me.jefe) return haceTareas() ? [P, R, E, G] : [P, R, G];
+  if (st.me.jefe) return [P, R, E, G];
   return [R, E, M];
 }
 function renderTop(all, stats) {
@@ -550,8 +551,17 @@ function repInfo(a) {
   const para = d.rep_para ? (d.rep_para === me ? "Te lo pidió " : "Pedido a " + (eq[d.rep_para] || d.nombre) + " por ") : "";
   return (d.rep_txt ? "“" + d.rep_txt + "” " : "") + "— " + (para || "") + (d.rep_por || "");
 }
-function startRutina(a) {
+function startRutina(a, directo) {
   if (!haceTareas()) return verCalificar(a);
+  // Supervisor: si la tarea ya tiene registros, elige entre tomar foto o revisar la última.
+  if (st.me.jefe && !directo && a.docs.some((d) => !d.anulado)) {
+    return sheet(`<h2>${esc(a.r.t)}</h2><span class="mu sm">${esc(a.text)}</span>
+      <button class="btn honey block" data-a="foto">${I.cam} Tomar foto</button><button class="btn lt block" data-a="ver">${I.eye} Ver y calificar la última</button><button class="btn lt block" data-a="no">Cancelar</button>`, (s, close) => {
+      $("[data-a=foto]", s).onclick = () => { close(); startRutina(a, true); };
+      $("[data-a=ver]", s).onclick = () => { close(); verCalificar(a); };
+      $("[data-a=no]", s).onclick = close;
+    });
+  }
   const r = a.r;
   if (a.noIni) return toast(st.me.jefe ? "La rutina aún no inicia. Iníciala con el botón de arriba." : "La rutina aún no inicia. Avísale a tu supervisor si ya hay que empezar.", 4500);
   if (a.rep) {
@@ -609,7 +619,7 @@ async function retrosSheet() {
         ${notas.map((sl) => `<div class="cmt"><b>${S.NOTAS[cal[sl.key].n]?.[0] || ""} ${esc(sl.task.t)}${sl.multi ? " · " + esc(sl.label) : ""}</b>${esc(cal[sl.key].c || S.NOTAS[cal[sl.key].n]?.[1] || "")}</div>`).join("")}</div>` }); });
     items.sort((a, b) => (a.f < b.f ? 1 : a.f > b.f ? -1 : a.at < b.at ? 1 : -1));
     let lastF = "", rows = "";
-    items.forEach((x, i) => { if (x.f !== lastF) { lastF = x.f; rows += `<div class="vday it" style="animation-delay:${i * 40}ms"><span>${x.f === today() ? "Hoy" : esc(S.diaCorto(x.f)) + " " + +x.f.slice(8)}</span></div>`; } rows += x.h.replace('class="mi', `style="animation-delay:${i * 40 + 20}ms" class="it mi`); });
+    items.forEach((x, i) => { if (x.f !== lastF) { lastF = x.f; rows += `<div class="vday it" style="animation-delay:${i * 40}ms"><span>${x.f === today() ? "Hoy" : esc(S.diaCorto(x.f)) + " " + +x.f.slice(8)}</span></div>`; } rows += `<div class="it" style="animation-delay:${i * 40 + 20}ms">${x.h}</div>`; });
     box.innerHTML = items.length ? `<p class="mu sm" style="margin:0 0 8px">Últimos 14 días. Lo más reciente arriba.</p><div class="vr pop" style="--x:50%">${rows}</div>` : `<div class="empty">Aún no tienes calificaciones. Cuando tu supervisor califique tus fotos, aparecerán aquí.</div>`;
     $$("[data-lbr]", box).forEach((im) => (im.onclick = () => lightbox(im.dataset.lbr, "")));
     if (st.hoy?.retros_nuevas) { api("retros_visto").catch(() => {}); st.hoy.retros_nuevas = 0; renderMain(); }
@@ -973,18 +983,35 @@ function wireSwipe(m) {
 /* ---------- Entregas ---------- */
 function viewEntregas() {
   const emp = st.me.emp, list = st.hoy?.entregas || [];
-  const combos = [];
-  S.TURNOS.forEach((t) => { if (emp.turnos.includes(t)) S.AREAS.forEach((a) => { if (emp.areas.includes(a)) combos.push([t, a]); }); });
-  if (!combos.length) return `<div class="empty">No tienes entregas habilitadas. Avísale al encargado.</div>`;
-  return `<div class="sect"><h2>Entregas de hoy</h2></div><div class="elist">${combos.map(([t, a]) => {
+  const puede = (t, a) => emp.ver || (emp.turnos.includes(t) && emp.areas.includes(a));
+  const areas = S.AREAS.filter((a) => S.TURNOS.some((t) => puede(t, a)));
+  if (!areas.length) return `<div class="empty">No tienes entregas habilitadas. Avísale al encargado.</div>`;
+  const hr = S.mxDate(nowMs()).getUTCHours(), toca = hr >= 20 || hr < 6 ? "cierre" : hr < 13 ? "apertura" : null;
+  const turnoBtn = (t, a) => {
+    if (!puede(t, a)) return "";
     const has = S.tasksOf(t, a).length > 0, tot = S.slots(a, t).length;
     const mine = list.filter((e) => e.area === a && e.turno === t && e.emp_id === emp.id).sort((x, y) => (x.inicio < y.inicio ? 1 : -1))[0];
-    const others = list.filter((e) => e.area === a && e.turno === t && e.estado === "entregado" && e.emp_id !== emp.id);
-    const n = mine ? S.countDone(mine) : 0;
-    const c = mine ? S.califEntrega(mine) : null;
-    const status = !has ? `<span class="pill gr">Próximamente</span>` : mine && S.pendRepetir(mine) ? `<span class="pill bad">🔁 Repetir ${S.pendRepetir(mine)} foto${S.pendRepetir(mine) > 1 ? "s" : ""}</span>` : mine?.estado === "entregado" ? `<span class="pill ok">Entregado ${S.horaIso(mine.fin)}${c.nota ? " · " + S.notaTxt(c.nota) : ""}</span>` : mine ? `<span class="pill run">En curso · ${n}/${tot} fotos</span>` : others.length ? `<span class="pill ok">Entregó ${esc(others[0].nombre)}</span>` : `<span class="mu xs">${S.tasksOf(t, a).length} tareas · ${tot} fotos</span>`;
-    return `<button class="ecard" data-t="${t}" data-a="${a}" ${has ? "" : "disabled"}><span class="tx"><span class="tg">${S.TURNO_NAME[t]}</span><span class="big">${S.AREA_NAME[a]}</span>${status}${mine && mine.estado !== "entregado" ? `<span class="bar"><i style="width:${(n / tot) * 100}%"></i></span>` : ""}</span><span class="arrow">${I.right}</span></button>`;
-  }).join("")}</div>`;
+    const otro = list.filter((e) => e.area === a && e.turno === t && e.estado === "entregado" && e.emp_id !== emp.id)[0];
+    const n = mine ? S.countDone(mine) : 0, pct = tot ? Math.round((n / tot) * 100) : 0, c = mine ? S.califEntrega(mine) : null, rp = mine ? S.pendRepetir(mine) : 0;
+    let est, cls, cta;
+    if (!has) { est = "Lista por definir"; cls = "off"; cta = "Próximamente"; }
+    else if (rp) { est = "🔁 Repetir " + rp + " foto" + (rp > 1 ? "s" : ""); cls = "rep"; cta = "Corregir"; }
+    else if (mine?.estado === "entregado") { est = "Entregado " + S.horaIso(mine.fin) + (c.nota ? " · " + S.notaTxt(c.nota) : ""); cls = "done"; cta = "Ver"; }
+    else if (mine) { est = n + " de " + tot + " fotos"; cls = "run"; cta = "Continuar"; }
+    else { est = otro ? "Ya la entregó " + otro.nombre : tot + " fotos"; cls = "new"; cta = "Empezar"; }
+    return `<button class="tbtn ${cls}${toca === t && cls !== "done" && cls !== "off" ? " toca" : ""}" data-t="${t}" data-a="${a}" ${has ? "" : "disabled"}>
+      <span class="tri" style="--p:${cls === "done" ? 100 : pct}"><span>${cls === "done" ? I.check : t === "cierre" ? I.moon : I.sun}</span></span>
+      <span class="ttx"><span class="tg">${S.TURNO_NAME[t]}</span><b>${esc(est)}</b>${cls === "run" ? `<span class="bar"><i style="width:${pct}%"></i></span>` : ""}</span>
+      <span class="tcta">${cta}${has ? I.right : ""}</span></button>`;
+  };
+  return `<div class="sect"><h2>Entregas de hoy</h2>${toca ? `<span class="pill run">Toca ${S.TURNO_NAME[toca].toLowerCase()}</span>` : ""}</div>
+    <div class="egrid">${areas.map((a, i) => `<section class="earea gl ${a}" style="animation-delay:${i * 90}ms"><span class="eorb" aria-hidden="true"></span>
+      <div class="ehd"><span class="eic">${I[a]}</span><div><span class="tg">Área</span><b>${S.AREA_NAME[a]}</b></div></div>
+      <div class="ebtns">${S.TURNOS.slice().reverse().map((t) => turnoBtn(t, a)).join("")}</div></section>`).join("")}</div>
+    <section class="etips gl" style="animation-delay:${areas.length * 90 + 60}ms"><b>${I.star} Para una entrega 🟢 Excelente</b>
+      <div class="tip"><span>💡</span><span><b>Con buena luz</b>Prende la luz del área antes de tomar la foto.</span></div>
+      <div class="tip"><span>🖼️</span><span><b>Que se vea completo</b>Aléjate un paso: la foto debe mostrar toda el área, no solo una parte.</span></div>
+      <div class="tip"><span>👀</span><span><b>Revisa antes de entregar</b>Toca cada foto para verla en grande; si salió borrosa, cámbiala.</span></div></section>`;
 }
 async function openEntrega(area, turno) {
   toast("Abriendo…", 8000);

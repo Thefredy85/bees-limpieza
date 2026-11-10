@@ -225,7 +225,7 @@ const handlers: Record<string, (b: Body, req: Request) => Promise<unknown>> = {
     if (!ses.emp) throw new HttpErr(403, "Solo los empleados hacen entregas.");
     const { area, turno } = b;
     if (!S.AREAS.includes(area) || !S.TURNOS.includes(turno)) throw new HttpErr(400, "Entrega no válida.");
-    if (!ses.emp.areas.includes(area) || !ses.emp.turnos.includes(turno)) throw new HttpErr(403, "No tienes habilitada esta entrega.");
+    if (!ses.emp.ver && (!ses.emp.areas.includes(area) || !ses.emp.turnos.includes(turno))) throw new HttpErr(403, "No tienes habilitada esta entrega.");
     if (!S.tasksOf(turno, area).length) throw new HttpErr(400, "Esta lista aún no está lista.");
     const j = S.jornadaOf(Date.now());
     const { data: open } = await sb.from("entregas").select("*").eq("fecha", j).eq("area", area).eq("turno", turno).eq("emp_id", ses.emp.id).eq("estado", "en_curso").maybeSingle();
