@@ -1,7 +1,8 @@
 /* Bee's Pizza · Checklist de limpieza — app móvil. */
 import * as S from "./shared.js";
 
-const API = "https://iwjhmdeffwhqxmcivfso.supabase.co/functions/v1/api";
+/* La app publicada usa "api"; cualquier otra dirección (vista previa de Netlify) usa la copia de prueba. */
+const API = "https://iwjhmdeffwhqxmcivfso.supabase.co/functions/v1/" + (location.hostname === "bees-limpieza.netlify.app" ? "api" : "api-prueba");
 const KEY = "sb_publishable_juXxPOjPZEbao5Ky4v1Yww_DD3xDjXj";
 const LS = "bees-checklist-v1";
 
@@ -356,7 +357,7 @@ async function afterLogin(r) {
   st.tab = st.me.jefe ? "panel" : "rutina"; st.tablero = null; st.enter = true;
   render();
   refreshHoy(); if (st.me.jefe) refreshTablero();
-  refreshAnimo();
+  refreshAnimo(); refreshPed(true);
 }
 
 /* ---------------- Carga de datos ---------------- */
@@ -374,7 +375,21 @@ async function refreshTablero(silent) {
   catch (e) { if (!silent) toast(e.message); }
 }
 async function refreshAnimo() { try { st.animo = await api("animo"); renderMain(); } catch {} }
-async function refreshEmps() { try { st.emps = (await api("empleados")).empleados; renderMain(); } catch (e) { toast(e.message); } }
+async function refreshPed(silent) {
+  if (!st.token) return;
+  const antes = st.ped ? new Set(st.ped.pendientes.map((x) => x.id)) : null;
+  try {
+    st.ped = await api("pedidos_hoy");
+    const nuevos = antes ? st.ped.pendientes.filter((x) => !antes.has(x.id)) : [];
+    if (nuevos.length && st.me && !st.me.admin) { chime(); vibrate([140, 80, 140]); toast("📷 Pedido para fotografiar: " + pedTit(nuevos[0]), 5000); }
+    renderMain();
+  } catch (e) { if (!silent) toast(e.message); }
+}
+async function refreshPedDia(silent) {
+  try { st.panel.ped = await api("pedidos_dia", { fecha: st.panel.fecha || today() }); renderMain(); }
+  catch (e) { if (!silent) toast(e.message); }
+}
+async function refreshEmps() { try { const r = await api("empleados"); st.emps = r.empleados; st.turnos = r.turnos; renderMain(); } catch (e) { toast(e.message); } }
 
 /* ================= VISTAS ================= */
 const root = () => $("#root");
@@ -448,9 +463,10 @@ function setupSheet() {
 const haceTareas = () => !!st.me?.emp && (!!st.me.emp.ver || !!st.me.emp.areas?.length);
 function tabsFor() {
   const P = ["panel", "Panel", I.grid], R = ["rutina", "Rutina", I.list], E = ["entregas", "Entregas", I.moon], M = ["midia", "Mi día", I.cal], G = ["registros", "Registros", I.chart], Q = ["empleados", "Equipo", I.users];
-  if (st.me.admin) return [P, R, G, Q];
-  if (st.me.jefe) return [P, R, E, G];
-  return [R, E, M];
+  const F = ["pedidos", "Pedidos", I.box];
+  if (st.me.admin) return [P, R, F, G, Q];
+  if (st.me.jefe) return [P, R, F, E, G];
+  return haceTareas() ? [R, F, E, M] : [R, E, M];
 }
 function renderTop(all, stats) {
   const top = $("#top"); if (!top) return;
@@ -475,12 +491,13 @@ function goTab(id, dir) {
   const m = $("#main"); if (m && dir) { m.classList.remove("slide-l", "slide-r"); void m.offsetWidth; m.classList.add(dir > 0 ? "slide-l" : "slide-r"); }
   if (st.tab === "registros") refreshPanel(); else if (st.tab === "empleados") refreshEmps(); else if (st.tab !== "ajustes") refreshHoy(true);
   if (st.tab === "panel") refreshTablero(true);
+  if (st.tab === "pedidos") refreshPed();
   if (st.tab === "midia" || st.tab === "rutina" || st.tab === "panel") refreshAnimo();
   if (st.tab === "ajustes" && st.me.admin && !st.panel.data && !st.tablero) refreshTablero(true);
 }
 function renderTabs(badge) {
   const t = $("#tabs"); if (!t) return;
-  t.innerHTML = tabsFor().map(([id, lbl, ic]) => `<button role="tab" data-tab="${id}" aria-selected="${st.tab === id}">${ic}<span>${lbl}</span>${id === "rutina" && badge ? `<span class="badge">${badge}</span>` : ""}</button>`).join("");
+  t.innerHTML = tabsFor().map(([id, lbl, ic]) => `<button role="tab" data-tab="${id}" aria-selected="${st.tab === id}">${ic}<span>${lbl}</span>${id === "rutina" && badge ? `<span class="badge">${badge}</span>` : ""}${id === "pedidos" && st.ped?.pendientes?.length ? `<span class="badge">${st.ped.pendientes.length}</span>` : ""}</button>`).join("");
   $$("[data-tab]", t).forEach((b) => (b.onclick = () => { const ids = tabsFor().map((x) => x[0]); goTab(b.dataset.tab, ids.indexOf(b.dataset.tab) - ids.indexOf(st.tab)); }));
 }
 function renderMain() {
@@ -495,6 +512,7 @@ function renderMain() {
   else if (st.tab === "entregas") main.innerHTML = st.ent ? viewChecklist() : viewEntregas();
   else if (st.tab === "midia") main.innerHTML = viewMiDia(all);
   else if (st.tab === "registros") main.innerHTML = viewRegistros();
+  else if (st.tab === "pedidos") main.innerHTML = viewPedidos();
   else if (st.tab === "empleados") main.innerHTML = viewEmpleados();
   else if (st.tab === "ajustes") main.innerHTML = viewAjustes();
   const nh = $("#hero", main);
@@ -617,6 +635,9 @@ async function retrosSheet() {
       items.push({ f: e.fecha, at: ultimo || e.fin || e.inicio, h: `<div class="mi" style="padding:12px;display:grid;gap:8px"><div style="display:flex;align-items:center;gap:8px"><div style="flex:1"><b>${S.TURNO_NAME[e.turno]} · ${S.AREA_NAME[e.area]}${nuevo(ultimo)}</b><br><span class="mu xs">${esc(S.diaCorto(e.fecha))} ${+e.fecha.slice(8)} · ${e.estado === "entregado" ? "entregaste " + S.horaIso(e.fin) : "en curso"}</span></div>${c.nota ? notaPill(c.nota) : `<span class="pill gr">Sin calificar</span>`}</div>
         ${e.nota_general ? `<div class="cmt"><b>Comentario general · ${esc(e.nota_por || "")}</b>${esc(e.nota_general)}</div>` : ""}
         ${notas.map((sl) => `<div class="cmt"><b>${S.NOTAS[cal[sl.key].n]?.[0] || ""} ${esc(sl.task.t)}${sl.multi ? " · " + esc(sl.label) : ""}</b>${esc(cal[sl.key].c || S.NOTAS[cal[sl.key].n]?.[1] || "")}</div>`).join("")}</div>` }); });
+    (R.pedidos || []).forEach((x) => { const url = R.urls[x.foto], ult = x.cal_at;
+      items.push({ f: x.fecha, at: ult || x.at, h: `<div class="mi" style="flex-wrap:wrap">${url ? `<img alt="" src="${esc(url)}" data-lbr="${esc(url)}">` : `<img alt="">`}<div style="flex:1;min-width:0"><b style="display:block">📦 ${esc(pedTit(x))}${nuevo(ult)}</b><span class="mu xs">${esc(x.resumen || "")} · ${S.horaIso(x.at)} · ${x.min_desp != null && x.min_desp <= S.FOTO_MIN ? "a tiempo" : "tarde (" + x.min_desp + " min)"}</span>${x.nota ? `<div style="margin-top:3px">${notaPill(x.nota)}</div>` : `<div style="margin-top:3px"><span class="pill gr">Sin calificar</span></div>`}</div>
+        ${x.coment ? `<div class="cmt" style="width:100%"><b>${esc(x.cal_por || "")}</b>${esc(x.coment)}</div>` : ""}</div>` }); });
     items.sort((a, b) => (a.f < b.f ? 1 : a.f > b.f ? -1 : a.at < b.at ? 1 : -1));
     let lastF = "", rows = "";
     items.forEach((x, i) => { if (x.f !== lastF) { lastF = x.f; rows += `<div class="vday it" style="animation-delay:${i * 40}ms"><span>${x.f === today() ? "Hoy" : esc(S.diaCorto(x.f)) + " " + +x.f.slice(8)}</span></div>`; } rows += `<div class="it" style="animation-delay:${i * 40 + 20}ms">${x.h}</div>`; });
@@ -950,12 +971,86 @@ function podioHtml() {
     : `<div class="empty" style="padding:14px">Aún no hay puntos esta semana. ¡El primero en registrar arranca el podio!</div>`;
   return h;
 }
-function puntosSheet() { sheet(`<h2>${I.trophy} Cómo se ganan puntos</h2><div class="mu sm" style="display:grid;gap:6px"><span>✅ Tarea de rutina a tiempo: <b>+3</b></span><span>⚠️ Tarea tarde: <b>+1</b></span><span>🔁 Te piden repetir: <b>−2</b></span><span>Calificación de cada foto: 🟢 <b>+2</b> · 🟡 <b>+1</b> · 🟠 <b>0</b> · 🔴 <b>−1</b></span><span>📦 Entrega completa: <b>+5</b>, más su calificación general (🟢 +4 · 🟡 +2 · 🔴 −2)</span><span>La semana va de lunes a domingo. El lunes se anuncia al colaborador de la semana.</span></div><button class="btn honey block" data-a="ok">Entendido</button>`, (s, c) => ($("[data-a=ok]", s).onclick = c)); }
+function puntosSheet() { sheet(`<h2>${I.trophy} Cómo se ganan puntos</h2><div class="mu sm" style="display:grid;gap:6px"><span>✅ Tarea de rutina a tiempo: <b>+3</b></span><span>⚠️ Tarea tarde: <b>+1</b></span><span>🔁 Te piden repetir: <b>−2</b></span><span>Calificación de cada foto: 🟢 <b>+2</b> · 🟡 <b>+1</b> · 🟠 <b>0</b> · 🔴 <b>−1</b></span><span>📦 Entrega completa: <b>+5</b>, más su calificación general (🟢 +4 · 🟡 +2 · 🔴 −2)</span><span>📷 Foto de pedido a tiempo (15 min): <b>+2</b> · tarde: <b>+1</b>, más su calificación (🟢 +4 · 🟡 +2 · 🟠 0 · 🔴 −2)</span><span>La semana va de lunes a domingo. El lunes se anuncia al colaborador de la semana.</span></div><button class="btn honey block" data-a="ok">Entendido</button>`, (s, c) => ($("[data-a=ok]", s).onclick = c)); }
 function semanaTabla() {
   const T = st.animo?.tabla;
   if (!T) return `<div class="empty"><div class="spin" style="margin:20px auto"></div></div>`;
   if (!T.length) return `<div class="empty">Aún no hay registros esta semana.</div>`;
-  return `<div class="card" style="margin:0 14px"><div class="mu xs" style="margin-bottom:6px">Semana desde el ${esc(S.fechaLarga(st.animo.semana_desde))}. Solo tú y los supervisores ven la tabla completa; el equipo ve el podio.</div>${T.map((p, i) => `<div class="emp"><div style="display:flex;gap:10px;align-items:center"><b style="font:400 22px/1 var(--fd);width:26px">${i + 1}</b><div><b>${esc(p.nombre)}</b><div class="mu xs">✅ ${p.ok} · ⚠️ ${p.late} · 🔁 ${p.rep} · 📦 ${p.ent}${p.nota ? " · " + S.NOTAS[p.nota][0] : ""}</div></div></div><span class="pill ${i === 0 ? "ok" : "gr"}">${p.pts} pts</span></div>`).join("")}</div>`;
+  return `<div class="card" style="margin:0 14px"><div class="mu xs" style="margin-bottom:6px">Semana desde el ${esc(S.fechaLarga(st.animo.semana_desde))}. Solo tú y los supervisores ven la tabla completa; el equipo ve el podio.</div>${T.map((p, i) => `<div class="emp"><div style="display:flex;gap:10px;align-items:center"><b style="font:400 22px/1 var(--fd);width:26px">${i + 1}</b><div><b>${esc(p.nombre)}</b><div class="mu xs">✅ ${p.ok} · ⚠️ ${p.late} · 🔁 ${p.rep} · 📦 ${p.ent}${p.fot ? " · 📷 " + p.fot : ""}${p.nota ? " · " + S.NOTAS[p.nota][0] : ""}</div></div></div><span class="pill ${i === 0 ? "ok" : "gr"}">${p.pts} pts</span></div>`).join("")}</div>`;
+}
+
+/* ---------- Fotos de pedidos de delivery ---------- */
+const PLAT = { uber: "Uber", didi: "DiDi", rappi: "Rappi", resv: "Reserv" };
+const pedTit = (x) => (PLAT[x.plat] || x.plat || "") + " #" + (x.code || "");
+const ptag = (x) => `<span class="ptag ${esc(x.plat || "")}">${esc((PLAT[x.plat] || x.plat || "").toUpperCase())}</span>`;
+const minTxt = (m) => (m < 1 ? "Recién entró" : "Hace " + m + " min");
+function viewPedidos() {
+  const P = st.ped;
+  if (!P) return `<div class="empty"><div class="spin" style="margin:30px auto"></div>Cargando pedidos…</div>`;
+  const sect = (t, pill) => `<div class="sect"><h2>${t}</h2>${pill || ""}</div>`;
+  let h = P.fuera ? `<div class="banner info" style="margin-top:12px">${I.alarm}<span>Estás fuera de tu horario (${esc(P.horario)}). Los pedidos por fotografiar te aparecen en tu turno.</span></div>`
+    : `<div class="banner info" style="margin-top:12px">${I.box}<span>Toma la foto con el pedido armado antes de dárselo al repartidor.</span></div>`;
+  const atr = P.pendientes.filter((x) => x.min >= S.FOTO_MIN), pen = P.pendientes.filter((x) => x.min < S.FOTO_MIN);
+  if (atr.length) h += sect("Ahora", `<span class="pill bad">${atr.length} atrasado${atr.length > 1 ? "s" : ""}</span>`) + atr.map((x) => `<button class="tcard" data-pf="${esc(x.id)}" style="margin:0 14px 8px;width:calc(100% - 28px)"><span class="tz">${I.alarm}</span><span class="tt"><span class="k">${x.min} min sin foto</span><b>${ptag(x)}${esc("#" + x.code)} · ${esc(x.resumen)}</b><span class="mu xs">${esc(x.cust)}${x.cust ? " · " : ""}registrado ${S.horaIso(x.at)}</span></span><span class="go">${I.cam}<span>Foto</span></span></button>`).join("");
+  if (!P.fuera) h += sect("Por fotografiar", `<span class="pill run">${pen.length}</span>`) + (pen.length ? `<div class="rows" style="margin:0 14px">${pen.map((x) => `<button class="row yellow" data-pf="${esc(x.id)}"><span class="tx"><b>${ptag(x)}${esc("#" + x.code)} · ${esc(x.resumen)}</b><span><em class="st">${minTxt(x.min)}</em> · ${esc(x.cust)}${x.cust ? " · " : ""}${S.horaIso(x.at)}</span></span><span class="cb" aria-hidden="true">${I.cam}</span></button>`).join("")}</div>`
+    : `<div class="allgood">${I.check}<span>${atr.length ? "Solo falta el atrasado." : "Todos los pedidos de la última hora tienen foto."}</span></div>`);
+  const hechos = (P.hechos || []).slice(0, 40);
+  h += sect("Ya con foto hoy", `<span class="pill ok">${(P.hechos || []).length}</span>`) + (hechos.length ? `<div class="rows" style="margin:0 14px">${hechos.map((x) => { const f = x.foto, url = P.urls[f.foto], mine = st.me.emp && f.emp_id === st.me.emp.id;
+    return `<button class="row green" ${st.me.jefe ? `data-pcal="${esc(f.id)}"` : url ? `data-lb="${esc(url)}" data-cap="${esc(pedTit(x))}"` : ""}><span class="tx"><b>${ptag(x)}${esc("#" + x.code)} · ${esc(x.resumen)}</b><span><em class="st">${mine ? "Tu foto" : "Foto de " + esc(f.nombre)}</em> · ${S.horaIso(f.at)} · ${f.min_desp <= S.FOTO_MIN ? "a tiempo" : "tarde"}${f.nota ? " · " + S.NOTAS[f.nota][0] : ""}</span></span><span class="cb" aria-hidden="true">${st.me.jefe && !f.nota ? I.star : I.check}</span></button>`; }).join("")}</div>`
+    : `<div class="empty" style="padding:10px">Todavía no hay fotos hoy.</div>`);
+  if (st.me.jefe && P.sin_foto) h += `<p class="mu xs pad" style="margin-top:10px">${P.sin_foto} pedido${P.sin_foto > 1 ? "s" : ""} de hace más de una hora se quedaron sin foto. Se ven en Registros → Pedidos.</p>`;
+  return h;
+}
+function registrosPedidos() {
+  const D = st.panel.ped;
+  if (!D || D.fecha !== (st.panel.fecha || st.panel.data?.fecha)) { if (!D) setTimeout(() => refreshPedDia(true), 0); return `<div class="empty"><div class="spin" style="margin:20px auto"></div>Cargando pedidos…</div>`; }
+  const L = D.lista, con = L.filter((x) => x.foto), porCal = con.filter((x) => !x.foto.nota);
+  let h = `<div class="kpis"><div class="kpi"><b>${L.length}</b><span>pedidos</span></div><div class="kpi"><b style="color:var(--ok)">${con.length}</b><span>con foto</span></div><div class="kpi"><b style="color:var(--red)">${L.length - con.length}</b><span>sin foto</span></div><div class="kpi"><b style="color:var(--honey-d)">${porCal.length}</b><span>por calificar</span></div></div>`;
+  if (!L.length) return h + `<div class="empty">Ese día no hay pedidos registrados por las tabletas.</div>`;
+  h += `<div class="pad" style="display:grid;gap:6px">${L.map((x) => { const f = x.foto, url = f && D.urls[f.foto];
+    if (!f) return `<div class="ev miss gl nd" style="margin:0;border-radius:0 12px 12px 0"><span><b class="et">${ptag(x)}${esc("#" + x.code)} · ${esc(x.resumen)}</b><br><span class="es">${S.horaIso(x.at)} · sin foto</span></span><span class="pill bad">Sin foto</span></div>`;
+    return `<button class="ev ${f.nota ? "" : "late"} gl" data-pcal="${esc(f.id)}" style="margin:0;border-radius:0 12px 12px 0;display:flex;align-items:center;gap:10px;padding:8px 10px;text-align:left;width:100%;cursor:pointer">${url ? `<img alt="" loading="lazy" src="${esc(url)}" style="width:52px;height:52px;border-radius:8px;object-fit:cover;flex:none">` : ""}<span style="flex:1;min-width:0"><b class="et">${ptag(x)}${esc("#" + x.code)} · ${esc(x.resumen)}</b><br><span class="es">${esc(f.nombre)}${f.jefe ? " (supervisor)" : ""} · ${S.horaIso(f.at)} · ${f.min_desp <= S.FOTO_MIN ? "a tiempo" : "tarde, " + f.min_desp + " min"}</span></span>${f.nota ? notaPill(f.nota) : `<span class="pill run">Calificar</span>`}</button>`; }).join("")}</div>`;
+  return h;
+}
+function fotoDe(id) {
+  const src = [...(st.ped?.hechos || []), ...(st.panel.ped?.lista || [])].find((x) => x.foto && x.foto.id === id);
+  if (!src) return null;
+  const urls = { ...(st.ped?.urls || {}), ...(st.panel.ped?.urls || {}) };
+  return { x: src, f: src.foto, url: urls[src.foto.foto] };
+}
+function calificarPedido(id) {
+  const it = fotoDe(id); if (!it) return toast("Esa foto ya no está en la lista.");
+  const { x, f, url } = it;
+  sheet(`<h2>${I.box} ${esc(pedTit(x))}</h2><span class="mu sm" style="margin-top:-6px">${esc(x.resumen)}</span>
+    ${url ? `<div class="gv"><img alt="" src="${esc(url)}"><span class="cnt">Foto de ${esc(f.nombre)} · ${S.horaIso(f.at)}</span></div>` : ""}
+    <span class="mu xs">${f.min_desp <= S.FOTO_MIN ? "A tiempo" : "Tarde: " + f.min_desp + " min después de registrar"}</span>
+    ${rateBtns(f.nota, "pn")}<label class="lb" for="pc">Comentario para ${esc(f.nombre)}</label><textarea id="pc" maxlength="300" placeholder="Opcional">${esc(f.coment || "")}</textarea>
+    <p class="err" id="pe"></p><button class="btn honey block" data-a="ok">Guardar calificación</button><button class="btn lt block" data-a="no">Cerrar</button>`, (s, close) => {
+    let nota = f.nota || null;
+    $$("[data-pn]", s).forEach((b) => (b.onclick = () => { nota = +b.dataset.pn; $$("[data-pn]", s).forEach((o) => { o.classList.toggle("on", o === b); o.setAttribute("aria-pressed", o === b); }); vibrate(15); }));
+    $("[data-a=no]", s).onclick = close;
+    $("[data-a=ok]", s).onclick = async (ev) => {
+      const b = ev.currentTarget; if (!nota && !$("#pc", s).value.trim()) return ($("#pe", s).textContent = "Elige una calificación o escribe un comentario.");
+      b.disabled = true;
+      try { const r = await api("pedido_calificar", { id: f.id, nota: nota ?? undefined, coment: $("#pc", s).value }); Object.assign(f, r.foto); close(); toast("Calificación guardada. Ya le avisamos a " + f.nombre + "."); renderMain(); }
+      catch (er) { $("#pe", s).textContent = er.message; b.disabled = false; }
+    };
+  });
+}
+function fotoPedido(id) {
+  const x = (st.ped?.pendientes || []).find((y) => y.id === id); if (!x) return toast("Ese pedido ya tiene foto o ya no está en la lista.");
+  openCamera({ title: pedTit(x), sub: x.resumen, onPhoto: async (blob) => {
+    toast("Subiendo la foto…", 8000);
+    try {
+      const r = await api("pedido_foto", { pedido_id: id, data: await blobToB64(blob) });
+      vibrate(40); doneOverlay("¡Foto enviada!", pedTit(x) + " quedó con tu foto.", r.a_tiempo ? "A tiempo" : "Fuera de los 15 minutos");
+      refreshPed(true);
+    } catch (e) { toast(e.message, 6000); }
+  } });
+}
+function wirePedidos(main) {
+  $$("[data-pf]", main).forEach((b) => (b.onclick = () => fotoPedido(b.dataset.pf)));
+  $$("[data-pcal]", main).forEach((b) => (b.onclick = () => calificarPedido(b.dataset.pcal)));
 }
 
 /* ---------- Tema ---------- */
@@ -1130,7 +1225,7 @@ function viewRegistros() {
   strip += `<label class="day" aria-pressed="${older}"><span class="dn">Otra</span><span class="dd">${older ? +j.slice(8) : "…"}</span><span class="dt"></span><input type="date" id="pickDay" max="${hoyJ}" value="${j}" aria-label="Elegir otra fecha"></label></div>`;
   const ini = D.inicio?.m ?? null;
   let h = `${isToday ? inicioCard(D.inicio, true) : ini != null ? `<div class="inicio-ok">${I.play}<span>Rutina iniciada a las <b>${S.fmtMin(ini)}</b></span></div>` : ""}<div class="sect" style="margin-top:6px"><h2>Jornada · ${esc(S.fechaLarga(j))}</h2></div>${strip}
-    <div class="seg" role="tablist"><button role="tab" data-sub="rutina" aria-selected="${P.sub === "rutina"}">Rutina</button><button role="tab" data-sub="entregas" aria-selected="${P.sub === "entregas"}">Entregas (${D.entregas.length})</button><button role="tab" data-sub="semana" aria-selected="${P.sub === "semana"}">Semana</button></div>`;
+    <div class="seg" role="tablist"><button role="tab" data-sub="rutina" aria-selected="${P.sub === "rutina"}">Rutina</button><button role="tab" data-sub="entregas" aria-selected="${P.sub === "entregas"}">Entregas (${D.entregas.length})</button><button role="tab" data-sub="pedidos" aria-selected="${P.sub === "pedidos"}">Pedidos</button><button role="tab" data-sub="semana" aria-selected="${P.sub === "semana"}">Semana</button></div>`;
   if (P.sub === "rutina") {
     const all = S.rutAll(D.rutina, j, isToday ? S.nowMinFor(j, nowMs()) : null, ini), s = S.dayStats(all);
     h += `<div class="kpis"><div class="kpi"><b>${s.pct == null ? "—" : s.pct + "%"}</b><span>a tiempo</span></div><div class="kpi"><b style="color:var(--ok)">${s.ok}</b><span>bien</span></div><div class="kpi"><b style="color:var(--honey-d)">${s.late}</b><span>tarde</span></div><div class="kpi"><b style="color:var(--red)">${s.missed}</b><span>sin hacer</span></div></div>
@@ -1169,6 +1264,8 @@ function viewRegistros() {
     };
     h += evts.length ? `<div class="pop" style="--x:50%;margin:4px 14px 0">${rama(horas.map((hr, ix) => { const [t, sb] = hm(hr); const cards = porHora[hr].map(evCard); return { node: rnode(t, sb, "it " + tonoHora(porHora[hr]), isToday && hr === Math.floor(S.nowMinFor(j, nowMs()) / 60) * 60), L: ix % 2 ? [] : cards, R: ix % 2 ? cards : [] }; }))}</div>
       <p class="mu xs pad" style="text-align:center;margin-top:10px">Toca un registro para ver la foto, calificar o pedir repetir. Mantenlo presionado para calificar rápido.</p>` : `<div class="empty">Sin registros para esta jornada.</div>`;
+  } else if (P.sub === "pedidos") {
+    h += registrosPedidos();
   } else if (P.sub === "semana") {
     h += podioHtml() + `<div class="sect"><h2>Tabla completa</h2></div>` + semanaTabla();
   } else {
@@ -1211,7 +1308,7 @@ function viewEmpleados() {
   if (!st.emps) return `<div class="empty"><div class="spin" style="margin:30px auto"></div></div>`;
   return `<div class="sect"><h2>Empleados</h2><span class="pill gr">${st.emps.length}</span></div>
     <div class="pad"><button class="btn honey block" data-a="addemp">+ Agregar empleado</button></div>
-    <div class="card" style="margin:10px 14px">${st.emps.length ? st.emps.map((e, i) => `<div class="emp"><div><b>${esc(e.nombre)}</b><div style="display:flex;gap:4px;flex-wrap:wrap;margin-top:4px">${e.ver ? '<span class="pill" style="background:var(--ink);color:var(--bg)">Supervisor</span>' : ""}${e.turnos.map((t) => `<span class="pill run">${S.TURNO_NAME[t]}</span>`).join("")}${e.areas.map((a) => `<span class="pill ok">${S.AREA_NAME[a]}</span>`).join("")}</div></div><div style="display:flex;gap:6px"><button class="btn lt sm" data-edit="${i}">Editar</button><button class="btn danger sm" data-rm="${i}" aria-label="Borrar a ${esc(e.nombre)}">${I.trash}</button></div></div>`).join("") : `<span class="mu">Agrega al primero con su nombre, su clave de 4 números y sus entregas.</span>`}</div>
+    <div class="card" style="margin:10px 14px">${st.emps.length ? st.emps.map((e, i) => `<div class="emp"><div><b>${esc(e.nombre)}</b><div style="display:flex;gap:4px;flex-wrap:wrap;margin-top:4px">${e.ver ? '<span class="pill" style="background:var(--ink);color:var(--bg)">Supervisor</span>' : ""}${e.turnos.map((t) => `<span class="pill run">${S.TURNO_NAME[t]}</span>`).join("")}${`<span class="pill hr">${esc(S.horarioTxt(e.horario, st.turnos))}</span>`}${e.areas.map((a) => `<span class="pill ok">${S.AREA_NAME[a]}</span>`).join("")}</div></div><div style="display:flex;gap:6px"><button class="btn lt sm" data-edit="${i}">Editar</button><button class="btn danger sm" data-rm="${i}" aria-label="Borrar a ${esc(e.nombre)}">${I.trash}</button></div></div>`).join("") : `<span class="mu">Agrega al primero con su nombre, su clave de 4 números y sus entregas.</span>`}</div>
     <p class="mu xs pad">Las claves se guardan protegidas: no se pueden ver, solo cambiar. Quien tenga "Puede ver todos los registros" entra con su clave y ve la bitácora y las entregas, sin poder borrar ni editar empleados.</p>`;
 }
 function empSheet(emp) {
@@ -1222,14 +1319,19 @@ function empSheet(emp) {
     <span class="lb">Área</span><div class="checks">${S.AREAS.map((a) => `<label><input type="checkbox" data-ar="${a}" ${e.areas.includes(a) ? "checked" : ""}> ${S.AREA_NAME[a]}</label>`).join("")}</div>
     <span class="lb">Entrega</span><div class="checks">${S.TURNOS.map((t) => `<label><input type="checkbox" data-tu="${t}" ${e.turnos.includes(t) ? "checked" : ""}> ${S.TURNO_NAME[t]}</label>`).join("")}</div>
     <span class="lb">Permisos</span><div class="checks"><label class="wide"><input type="checkbox" id="ev" ${e.ver ? "checked" : ""}> Puede ver todos los registros (jefe de piso o gerente)</label></div>
+    <span class="lb">Horario de trabajo</span><div class="checks">${["t1", "t2", "otro", "todo"].map((k) => `<label><input type="radio" name="eh" value="${k}" ${(e.horario?.tipo || "todo") === k ? "checked" : ""}> ${S.HOR_NAME[k]}</label>`).join("")}</div>
+    <div class="dnd-h" id="ehx" ${e.horario?.tipo === "otro" ? "" : "hidden"}><label>Entra<input type="time" id="ehi" value="${esc(e.horario?.ini || "12:00")}"></label><label>Sale<input type="time" id="ehf" value="${esc(e.horario?.fin || "20:00")}"></label></div>
+    <span class="mu xs">Fuera de su horario no ve pedidos por fotografiar ni le suenan sus avisos. Los turnos se cambian en Ajustes.</span>
     <p class="err" id="ee"></p><button class="btn honey block" data-a="ok">Guardar</button><button class="btn lt block" data-a="no">Cancelar</button>`, (s, close) => {
     $("#ep", s).addEventListener("input", (ev) => (ev.target.value = ev.target.value.replace(/\D/g, "").slice(0, 4)));
     $("[data-a=no]", s).onclick = close;
+    $$("[name=eh]", s).forEach((r) => (r.onchange = () => ($("#ehx", s).hidden = r.value !== "otro" || !r.checked)));
     $("[data-a=ok]", s).onclick = async (ev) => {
       const b = ev.currentTarget; $("#ee", s).textContent = ""; b.disabled = true; b.textContent = "Guardando…";
+      const ht = ($("[name=eh]:checked", s) || {}).value || "todo", horario = ht === "todo" ? null : ht === "otro" ? { tipo: "otro", ini: $("#ehi", s).value, fin: $("#ehf", s).value } : { tipo: ht };
       try {
-        const r = await api("empleado_guardar", { id: emp?.id, nombre: $("#en", s).value, pin: $("#ep", s).value || undefined, areas: $$("[data-ar]", s).filter((c) => c.checked).map((c) => c.dataset.ar), turnos: $$("[data-tu]", s).filter((c) => c.checked).map((c) => c.dataset.tu), ver: $("#ev", s).checked });
-        st.emps = r.empleados; close(); renderMain(); toast(emp ? "Empleado actualizado." : "Empleado agregado.");
+        const r = await api("empleado_guardar", { id: emp?.id, nombre: $("#en", s).value, pin: $("#ep", s).value || undefined, areas: $$("[data-ar]", s).filter((c) => c.checked).map((c) => c.dataset.ar), turnos: $$("[data-tu]", s).filter((c) => c.checked).map((c) => c.dataset.tu), ver: $("#ev", s).checked, horario });
+        st.emps = r.empleados; if (r.turnos) st.turnos = r.turnos; close(); renderMain(); toast(emp ? "Empleado actualizado." : "Empleado agregado.");
       } catch (er) { $("#ee", s).textContent = er.message; b.disabled = false; b.textContent = "Guardar"; }
     };
   });
@@ -1246,6 +1348,10 @@ function viewAjustes() {
     <div class="dnd ${pushOn ? "" : "dis"}"><label class="sw"><input type="checkbox" id="dndOn" ${dnd.on ? "checked" : ""} ${pushOn ? "" : "disabled"}><span></span><b>No molestar</b></label>
     <div class="dnd-h"><label>Desde<input type="time" id="dndIni" value="${esc(dnd.ini)}" ${pushOn ? "" : "disabled"}></label><label>Hasta<input type="time" id="dndFin" value="${esc(dnd.fin)}" ${pushOn ? "" : "disabled"}></label></div>
     <span class="mu xs">En ese horario no te suena nada. Al terminar te llega un solo resumen.</span><button class="btn lt sm" data-a="dnd" ${pushOn ? "" : "disabled"}>Guardar No molestar</button></div>`);
+  if (st.me.admin) { const T = st.turnos || st.hoy?.turnos || S.TURNOS_DEF;
+    h += card(`<b>${I.alarm} Turnos de la sucursal</b><span class="mu sm">Con estos horarios se decide quién ve los pedidos por fotografiar y a quién le suenan sus avisos.</span>
+      <div class="hor">${[["t1", "1er turno"], ["t2", "2º turno"]].map(([k, n]) => `<label><span>${n}</span><span style="display:flex;gap:6px"><input type="time" data-tn="${k}:ini" value="${esc(T[k]?.ini || "")}"><input type="time" data-tn="${k}:fin" value="${esc(T[k]?.fin || "")}"></span></label>`).join("")}</div>
+      <button class="btn lt" data-a="turnos">Guardar turnos</button>`); }
   if (st.me.jefe && hor) h += card(`<b>${I.play} Inicio de la rutina</b><span class="mu sm">${st.me.admin ? "Hora en que la rutina se inicia sola cada día. Déjala vacía para iniciarla a mano. Tú y los supervisores también pueden iniciarla antes desde la app." : "La programa el administrador. Tú puedes iniciarla antes desde la pantalla de rutina."}</span>
     <div class="hor">${[1, 2, 3, 4, 5, 6, 0].map((d) => `<label><span>${S.DIAS_SEM[d]}</span><input type="time" data-hd="${d}" value="${esc(hor[String(d)] || "")}" ${st.me.admin ? "" : "disabled"}></label>`).join("")}</div>${st.me.admin ? `<button class="btn lt" data-a="horario">Guardar horario</button>` : ""}`);
   if (st.installEvt) h += card(`<b>Instalar app</b><button class="btn lt" data-a="install">${I.dl} Instalar en este celular</button>`);
@@ -1338,11 +1444,12 @@ function wireMain(main, all) {
   $$("[data-lb]", main).forEach((b) => (b.onclick = () => lightbox(b.dataset.lb, b.dataset.cap)));
   $$("[data-copy]", main).forEach((b) => (b.onclick = () => copy(b.dataset.copy === "rutina" ? S.resumenRutina(today(), st.hoy.rutina, true, iniHoy()) : S.resumenRutina(st.panel.data.fecha, st.panel.data.rutina, st.panel.data.fecha === st.panel.data.hoy, st.panel.data.inicio?.m ?? null))));
   // Registros
-  $$("[data-day]", main).forEach((b) => (b.onclick = () => { st.panel.fecha = b.dataset.day; st.panel.data = { ...st.panel.data, fecha: b.dataset.day }; refreshPanel(); }));
-  $("#pickDay", main) && ($("#pickDay", main).onchange = (e) => { if (e.target.value) { st.panel.fecha = e.target.value; refreshPanel(); } });
+  $$("[data-day]", main).forEach((b) => (b.onclick = () => { st.panel.fecha = b.dataset.day; st.panel.data = { ...st.panel.data, fecha: b.dataset.day }; refreshPanel(); if (st.panel.sub === "pedidos") { st.panel.ped = null; refreshPedDia(); } }));
+  $("#pickDay", main) && ($("#pickDay", main).onchange = (e) => { if (e.target.value) { st.panel.fecha = e.target.value; refreshPanel(); if (st.panel.sub === "pedidos") { st.panel.ped = null; refreshPedDia(); } } });
   const strip = $("#strip", main), sel = strip && $('[aria-pressed="true"]', strip);
   if (strip && sel) strip.scrollLeft = Math.max(0, sel.offsetLeft - strip.clientWidth / 2 + sel.clientWidth / 2);
-  $$("[data-sub]", main).forEach((b) => (b.onclick = () => { st.panel.sub = b.dataset.sub; renderMain(); if (b.dataset.sub === "semana") refreshAnimo(); }));
+  $$("[data-sub]", main).forEach((b) => (b.onclick = () => { st.panel.sub = b.dataset.sub; renderMain(); if (b.dataset.sub === "semana") refreshAnimo(); if (b.dataset.sub === "pedidos") refreshPedDia(); }));
+  wirePedidos(main);
   // Rutina nueva, retros, inicio, podio
   $$("[data-rv]", main).forEach((b) => (b.onclick = () => { st.rutView = b.dataset.rv; const v = store.get(); v.rutView = st.rutView; store.set(v); st.tlScrolled = false; renderMain(); }));
   $$("[data-tlh]", main).forEach((b) => (b.onclick = () => { const k = b.dataset.tlh, key = k === "past" || k === "all" ? k : +k; if (st.tlOpen.has(key)) st.tlOpen.delete(key); else { st.tlOpen.add(key); st.accJust = "h" + key; } renderMain(); }));
@@ -1357,6 +1464,11 @@ function wireMain(main, all) {
   $("[data-a=nombre]", main) && ($("[data-a=nombre]", main).onclick = async (ev) => { const b = ev.currentTarget, n = $("#myName", main).value.trim(); if (!n) return toast("Escribe tu nombre."); b.disabled = true; try { const r = await api("mi_nombre", { nombre: n }); st.me.nombre = r.nombre; saveSession(); st.heroDone = false; renderMain(); toast("Nombre guardado."); } catch (e) { toast(e.message); } b.disabled = false; });
   $("[data-a=dnd]", main) && ($("[data-a=dnd]", main).onclick = guardarDnd);
   $("[data-a=horario]", main) && ($("[data-a=horario]", main).onclick = guardarHorario);
+  $("[data-a=turnos]", main) && ($("[data-a=turnos]", main).onclick = async (ev) => {
+    const b = ev.currentTarget, t = { t1: {}, t2: {} };
+    $$("[data-tn]", main).forEach((i) => { const [k, f] = i.dataset.tn.split(":"); t[k][f] = i.value; });
+    b.disabled = true; try { const r = await api("turnos_guardar", { turnos: t }); st.turnos = r.turnos; toast("Turnos guardados."); } catch (er) { toast(er.message); } b.disabled = false;
+  });
   $("[data-a=salir]", main) && ($("[data-a=salir]", main).onclick = salirSheet);
   $$("[data-zf]", main).forEach((b) => (b.onclick = () => { st.panel.zone = b.dataset.zf; renderMain(); }));
   // Calificar rutina
@@ -1405,6 +1517,9 @@ const typing = () => { const a = document.activeElement; return a && (a.tagName 
 setInterval(() => { if (!st.token || document.hidden || $(".cam") || typing()) return; renderMain(); }, 30000);
 setInterval(() => { if (!st.token || document.hidden || $(".cam") || $(".sheet-bg") || $(".qpop") || $(".rc.gone") || typing()) return; if (st.tab === "registros") refreshPanel(true); else if (st.tab !== "empleados" && st.tab !== "ajustes") refreshHoy(true); if (st.tab === "panel") refreshTablero(true); }, 25000);
 setInterval(() => { if (st.token && !document.hidden) refreshAnimo(); }, 5 * 60e3);
+// Pedidos por fotografiar: cada 30 s en su pestaña, cada minuto para el contador
+setInterval(() => { if (!st.token || document.hidden || $(".cam") || $(".sheet-bg") || typing()) return; if (st.tab === "pedidos") refreshPed(true); else if (st.tab === "registros" && st.panel.sub === "pedidos") refreshPedDia(true); }, 30000);
+setInterval(() => { if (st.token && !document.hidden && st.tab !== "pedidos" && !$(".cam")) refreshPed(true); }, 60000);
 document.addEventListener("visibilitychange", () => { if (!document.hidden && st.token) { if (st.tab === "registros") refreshPanel(true); else refreshHoy(true); if (st.tab === "panel") refreshTablero(true); } });
 
 (async function boot() {

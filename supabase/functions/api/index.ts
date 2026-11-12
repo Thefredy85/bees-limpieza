@@ -36,7 +36,7 @@ const isPin = (p: unknown) => typeof p === "string" && /^\d{4}$/.test(p);
 
 async function getSession(token?: string) {
   if (!token) throw new HttpErr(401, "Tu sesión terminó. Vuelve a marcar tu clave.");
-  const { data } = await sb.from("sesiones").select("token,rol,emp_id,expira,empleados(id,nombre,areas,turnos,ver)").eq("token", token).maybeSingle();
+  const { data } = await sb.from("sesiones").select("token,rol,emp_id,expira,empleados(id,nombre,areas,turnos,ver,horario)").eq("token", token).maybeSingle();
   if (!data || new Date(data.expira) < new Date()) throw new HttpErr(401, "Tu sesión terminó. Vuelve a marcar tu clave.");
   const emp: any = (data as any).empleados || null;
   let nombre = emp?.nombre || "";
@@ -50,7 +50,7 @@ async function newSession(rol: "emp" | "admin", empId: string | null) {
   await sb.from("sesiones").delete().lt("expira", new Date().toISOString());
   return data.token as string;
 }
-function publicEmp(e: any) { return e ? { id: e.id, nombre: e.nombre, areas: e.areas, turnos: e.turnos, ver: e.ver } : null; }
+function publicEmp(e: any) { return e ? { id: e.id, nombre: e.nombre, areas: e.areas, turnos: e.turnos, ver: e.ver, horario: e.horario || null } : null; }
 
 /* ---------- Fotos (bucket privado, enlaces firmados de 2 h) ---------- */
 function b64ToBytes(b64: string) {
@@ -153,7 +153,53 @@ async function retrosNuevas(empId: string) {
   const v = e?.retro_visto || "";
   let n = (rut || []).filter((r: any) => (r.cal_at || "") > v || (r.rep_at || "") > v).length;
   (ent || []).forEach((x: any) => { if ((x.nota_at || "") > v) n++; Object.values(x.calif || {}).forEach((c: any) => { if (c && (c.at || "") > v) n++; }); });
+  const { data: pf } = await sb.from("pedido_fotos").select("cal_at").eq("emp_id", empId).gte("fecha", desde).not("cal_at", "is", null);
+  n += (pf || []).filter((x: any) => (x.cal_at || "") > v).length;
   return n;
+}
+
+/* ---------- Fotos de pedidos de delivery ---------- */
+let PRUEBA = false;   // la copia de prueba (api-prueba) solo avisa a supervisores y administrador
+async function turnosCfg() { const { data } = await sb.from("config").select("valor").eq("clave", "turnos").maybeSingle(); return (data?.valor || S.TURNOS_DEF) as any; }
+const inicioJornadaIso = (j: string) => new Date(S.jMidnightMs(j) + 6 * 3600e3).toISOString();
+const PLAT_N: Record<string, string> = { uber: "Uber", didi: "DiDi", rappi: "Rappi", resv: "Reservándonos" };
+const resumenPedido = (p: any) => (Array.isArray(p.items) ? p.items : []).map((i: any) => (i.qty || 1) + "× " + i.n + (i.orilla ? " + orilla" : "")).join(" · ") || "Sin productos";
+const tituloPedido = (p: any) => (PLAT_N[p.plat] || p.plat) + " #" + (p.code || "");
+const minDesde = (iso: string) => Math.max(0, Math.round((Date.now() - Date.parse(iso)) / 60000));
+/* Avisa a quien esté en su horario (y a supervisores y administrador). En la prueba, solo a supervisores y administrador. */
+async function notifyEnTurno(payload: { title: string; body: string; tag?: string }) {
+  const s = await secrets();
+  if (!s.vapid_public || !s.vapid_private) return;
+  webpush.setVapidDetails("mailto:avisos@beespizza.app", s.vapid_public, s.vapid_private);
+  const [{ data: subs }, { data: emps }, turnos] = await Promise.all([
+    sb.from("push_subs").select("endpoint,p256dh,auth,jefe,rol,emp_id,dnd_ini,dnd_fin,pend"),
+    sb.from("empleados").select("id,horario,areas,ver"), turnosCfg(),
+  ]);
+  const E = Object.fromEntries((emps || []).map((e: any) => [e.id, e]));
+  const cm = relojMin();
+  await Promise.all((subs || []).map(async (sub: any) => {
+    const e = sub.emp_id ? E[sub.emp_id] : null;
+    if (PRUEBA && !sub.jefe) return;
+    if (sub.rol !== "admin") { if (!e) return; if (!e.ver && !e.areas?.length) return; if (!S.enHorario(e.horario, turnos, cm)) return; }
+    if (enDnd(sub, cm)) { await sb.from("push_subs").update({ pend: (sub.pend || 0) + 1 }).eq("endpoint", sub.endpoint); return; }
+    try { await webpush.sendNotification({ endpoint: sub.endpoint, keys: { p256dh: sub.p256dh, auth: sub.auth } }, JSON.stringify(payload), { TTL: 1800, urgency: "high" }); }
+    catch (er: any) { if (er?.statusCode === 404 || er?.statusCode === 410) await sb.from("push_subs").delete().eq("endpoint", sub.endpoint); }
+  }));
+}
+async function pedidosConFoto(desdeIso: string, hastaIso?: string, dia?: string) {
+  let q = sb.from("delivery_pedidos").select("id,dia,plat,code,cust,items,total,created_at").neq("code", "prueba").order("created_at", { ascending: false }).limit(300);
+  if (dia) q = q.eq("dia", dia); else q = q.gte("created_at", desdeIso);
+  if (hastaIso) q = q.lt("created_at", hastaIso);
+  const { data: peds } = await q;
+  const ids = (peds || []).map((x: any) => x.id);
+  const { data: fotos } = ids.length ? await sb.from("pedido_fotos").select("*").in("pedido_id", ids) : { data: [] as any[] };
+  const F = Object.fromEntries((fotos || []).map((f: any) => [f.pedido_id, f]));
+  return (peds || []).map((x: any) => ({ id: x.id, plat: x.plat, code: x.code, cust: x.cust || "", resumen: resumenPedido(x), total: x.total, at: x.created_at, foto: F[x.id] || null }));
+}
+
+async function avisarCalificada(f: any) {
+  if (!f.emp_id || (f.nota == null && !f.coment)) return;
+  await notifyEmp(f.emp_id, { title: (f.nota ? S.NOTAS[f.nota][0] + " " : "💬 ") + "Tu foto de " + (PLAT_N[f.plat] || f.plat) + " #" + f.code + (f.nota ? ": " + S.NOTAS[f.nota][1] : ""), body: (f.coment ? f.coment + " — " : "") + (f.cal_por || "Administrador") + ". Revísalo en Mi día → Retros.", tag: "cal-ped-" + f.id });
 }
 
 /* ---------- Acciones ---------- */
@@ -176,7 +222,7 @@ const handlers: Record<string, (b: Body, req: Request) => Promise<unknown>> = {
     const { count } = await sb.from("login_fallos").select("id", { count: "exact", head: true }).eq("ip", ip).gte("ts", since);
     if ((count || 0) > MAX_FAILS) throw new HttpErr(429, "Demasiados intentos. Espera 10 minutos.");
     const h = await hashPin(b.pin);
-    const { data: emp } = await sb.from("empleados").select("id,nombre,areas,turnos,ver").eq("pin_hash", h).maybeSingle();
+    const { data: emp } = await sb.from("empleados").select("id,nombre,areas,turnos,ver,horario").eq("pin_hash", h).maybeSingle();
     const s = await secrets();
     const ok = async () => { if (intento) await sb.from("login_fallos").delete().eq("id", intento.id); };
     if (emp) { await ok(); return { token: await newSession("emp", emp.id), rol: "emp", emp: publicEmp(emp), nombre: emp.nombre, jefe: !!emp.ver, admin: false, vapid: s.vapid_public }; }
@@ -217,7 +263,7 @@ const handlers: Record<string, (b: Body, req: Request) => Promise<unknown>> = {
     const myEnt = (ent || []).filter((e: any) => ses.emp && e.emp_id === ses.emp.id).flatMap(entregaFotos);
     const { data: eq } = await sb.from("empleados").select("id,nombre");
     const ini = await inicioInfo(j, S.nowMinFor(j));
-    return { fecha: j, ahora: Date.now(), entregas: ent || [], rutina: rut || [], urls: await signed(ses.jefe ? [...(rut || []).map((r: any) => r.foto), ...(ent || []).flatMap(entregaFotos)] : [...mine, ...myEnt]), emp: publicEmp(ses.emp), nombre: ses.nombre, equipo: Object.fromEntries((eq || []).map((x: any) => [x.id, x.nombre])), inicio: ini, retros_nuevas: ses.emp ? await retrosNuevas(ses.emp.id) : 0 };
+    return { fecha: j, ahora: Date.now(), entregas: ent || [], rutina: rut || [], urls: await signed(ses.jefe ? [...(rut || []).map((r: any) => r.foto), ...(ent || []).flatMap(entregaFotos)] : [...mine, ...myEnt]), emp: publicEmp(ses.emp), nombre: ses.nombre, equipo: Object.fromEntries((eq || []).map((x: any) => [x.id, x.nombre])), inicio: ini, retros_nuevas: ses.emp ? await retrosNuevas(ses.emp.id) : 0, turnos: await turnosCfg() };
   },
 
   async entrega_iniciar(b) {
@@ -503,15 +549,16 @@ const handlers: Record<string, (b: Body, req: Request) => Promise<unknown>> = {
 
   async mis_retros(b) {
     const ses = await getSession(b.token);
-    if (!ses.emp) return { rutina: [], entregas: [], urls: {}, visto: null };
+    if (!ses.emp) return { rutina: [], entregas: [], pedidos: [], urls: {}, visto: null };
     const desde = S.addDays(S.jornadaOf(Date.now()), -13);
     const [{ data: rut }, { data: ent }, { data: e }] = await Promise.all([
       sb.from("rutina").select(RUT_COLS).eq("emp_id", ses.emp.id).gte("fecha", desde).or("nota.not.is.null,coment.not.is.null,anulado.eq.true").order("at", { ascending: false }),
       sb.from("entregas").select("*").eq("emp_id", ses.emp.id).gte("fecha", desde).order("inicio", { ascending: false }),
       sb.from("empleados").select("retro_visto").eq("id", ses.emp.id).maybeSingle(),
     ]);
-    const paths = [...(rut || []).map((r: any) => r.foto), ...(ent || []).flatMap((x: any) => Object.entries(x.fotos || {}).filter(([k]) => x.calif?.[k]?.c || x.repetir?.[k]).map(([, p]) => p as string))];
-    return { rutina: rut || [], entregas: ent || [], urls: await signed(paths), visto: e?.retro_visto || null };
+    const { data: ped } = await sb.from("pedido_fotos").select("*").eq("emp_id", ses.emp.id).gte("fecha", desde).order("at", { ascending: false });
+    const paths = [...(rut || []).map((r: any) => r.foto), ...(ent || []).flatMap((x: any) => Object.entries(x.fotos || {}).filter(([k]) => x.calif?.[k]?.c || x.repetir?.[k]).map(([, p]) => p as string)), ...(ped || []).map((x: any) => x.foto)];
+    return { rutina: rut || [], entregas: ent || [], pedidos: ped || [], urls: await signed(paths), visto: e?.retro_visto || null };
   },
 
   async retros_visto(b) {
@@ -528,14 +575,15 @@ const handlers: Record<string, (b: Body, req: Request) => Promise<unknown>> = {
       sb.from("entregas").select("fecha,emp_id,nombre,estado,area,turno,fotos,calif").gte("fecha", lunesAnt),
       horarioCfg(),
     ]);
+    const { data: pf } = await sb.from("pedido_fotos").select("fecha,emp_id,nombre,jefe,min_desp,nota").gte("fecha", lunesAnt);
     const inis = await iniciosRango(desde < lunesAnt ? desde : lunesAnt, hoyJ, hor, S.nowMinFor(hoyJ));
     const porDia: Record<string, any[]> = {};
     (rut || []).forEach((d: any) => (porDia[d.fecha] = porDia[d.fecha] || []).push(d));
     const dias: Record<string, any> = {};
     Object.keys(inis).forEach((j) => { const docs = (porDia[j] || []).sort((a: any, c: any) => (a.at < c.at ? -1 : 1)); dias[j] = S.porPersonaDia(docs, j, j === hoyJ ? S.nowMinFor(j) : null, inis[j]); });
     const rango = (a: string, z: string) => Object.keys(dias).filter((j) => j >= a && j <= z);
-    const semana = S.puntosSemana(rango(lunes, hoyJ).map((j) => dias[j]), (ent || []).filter((e: any) => e.fecha >= lunes));
-    const pasada = S.puntosSemana(rango(lunesAnt, S.addDays(lunes, -1)).map((j) => dias[j]), (ent || []).filter((e: any) => e.fecha >= lunesAnt && e.fecha < lunes));
+    const semana = S.puntosSemana(rango(lunes, hoyJ).map((j) => dias[j]), (ent || []).filter((e: any) => e.fecha >= lunes), (pf || []).filter((f: any) => f.fecha >= lunes));
+    const pasada = S.puntosSemana(rango(lunesAnt, S.addDays(lunes, -1)).map((j) => dias[j]), (ent || []).filter((e: any) => e.fecha >= lunesAnt && e.fecha < lunes), (pf || []).filter((f: any) => f.fecha >= lunesAnt && f.fecha < lunes));
     const desc = Object.keys(dias).sort().reverse().map((j) => dias[j]);
     const corto = (p: any) => ({ nombre: p.nombre, pts: p.pts, nota: p.nota });
     return { racha: ses.emp ? S.rachaDe(ses.emp.id, desc) : null, podio: semana.slice(0, 3).map(corto), ganador: pasada[0] && pasada[0].pts > 0 ? corto(pasada[0]) : null, semana_desde: lunes, tabla: ses.jefe ? semana : undefined };
@@ -562,8 +610,8 @@ const handlers: Record<string, (b: Body, req: Request) => Promise<unknown>> = {
   async empleados(b) {
     const ses = await getSession(b.token);
     if (!ses.admin) throw new HttpErr(403, "Solo el administrador.");
-    const { data } = await sb.from("empleados").select("id,nombre,areas,turnos,ver").order("creado");
-    return { empleados: data || [] };
+    const { data } = await sb.from("empleados").select("id,nombre,areas,turnos,ver,horario").order("creado");
+    return { empleados: data || [], turnos: await turnosCfg() };
   },
 
   async empleado_guardar(b) {
@@ -579,6 +627,11 @@ const handlers: Record<string, (b: Body, req: Request) => Promise<unknown>> = {
     if (!ver && !areas.length) throw new HttpErr(400, "Elige al menos un área: Cocina o Salón.");
     if (!ver && !turnos.length) throw new HttpErr(400, "Elige al menos una entrega: Apertura o Cierre.");
     const row: any = { nombre, areas, turnos, ver };
+    if (b.horario !== undefined) {
+      const h = b.horario || {}, tipo = ["t1", "t2", "otro", "todo"].includes(h.tipo) ? h.tipo : null;
+      if (tipo === "otro" && (S.hhmmToMin(h.ini) == null || S.hhmmToMin(h.fin) == null || h.ini === h.fin)) throw new HttpErr(400, "Escribe a qué hora entra y a qué hora sale.");
+      row.horario = tipo ? (tipo === "otro" ? { tipo, ini: h.ini, fin: h.fin } : { tipo }) : null;
+    }
     if (b.pin) {
       const h = await hashPin(b.pin);
       const { data: adm } = await sb.from("admin_cfg").select("pin_hash").eq("id", 1).maybeSingle();
@@ -641,6 +694,110 @@ const handlers: Record<string, (b: Body, req: Request) => Promise<unknown>> = {
     return { ok: true };
   },
 
+  /* ----- Fotos de pedidos ----- */
+  async pedidos_hoy(b) {
+    const ses = await getSession(b.token);
+    const j = S.jornadaOf(Date.now()), turnos = await turnosCfg();
+    const fuera = !!ses.emp && !ses.jefe && !S.enHorario(ses.emp.horario, turnos, relojMin());
+    const lista = await pedidosConFoto(inicioJornadaIso(j));
+    const ventana = Date.now() - S.FOTO_VENTANA * 60e3;
+    const pend = lista.filter((x: any) => !x.foto && Date.parse(x.at) > ventana).map((x: any) => ({ ...x, min: minDesde(x.at) }));
+    const hechos = lista.filter((x: any) => x.foto);
+    const sinFoto = lista.filter((x: any) => !x.foto && Date.parse(x.at) <= ventana).length;
+    const mias = hechos.filter((x: any) => ses.jefe || (ses.emp && x.foto.emp_id === ses.emp.id)).map((x: any) => x.foto.foto);
+    return { fecha: j, ahora: Date.now(), fuera, horario: ses.emp ? S.horarioTxt(ses.emp.horario, turnos) : S.HOR_NAME.todo, pendientes: fuera ? [] : pend, hechos, sin_foto: sinFoto, urls: await signed(mias) };
+  },
+
+  async pedido_foto(b) {
+    const ses = await getSession(b.token);
+    if (ses.emp && !ses.emp.ver && !ses.emp.areas?.length) throw new HttpErr(403, "No tienes habilitadas las fotos.");
+    const { data: p } = await sb.from("delivery_pedidos").select("id,dia,plat,code,cust,items,created_at").eq("id", String(b.pedido_id || "")).maybeSingle();
+    if (!p) throw new HttpErr(404, "Ese pedido ya no existe.");
+    if (Date.now() - Date.parse(p.created_at) > 12 * 3600e3) throw new HttpErr(409, "Ese pedido es de hace más de 12 horas.");
+    const { data: prev } = await sb.from("pedido_fotos").select("id,foto,emp_id").eq("pedido_id", p.id).maybeSingle();
+    if (prev && !ses.jefe && prev.emp_id !== ses.emp?.id) throw new HttpErr(409, "Ese pedido ya tiene foto de otra persona.");
+    const j = S.jornadaOf(Date.parse(p.created_at));
+    const path = await uploadFoto("pedidos/" + j, b.data);
+    const row = { pedido_id: p.id, fecha: j, plat: p.plat, code: p.code, resumen: resumenPedido(p), foto: path, emp_id: ses.emp?.id || null, nombre: quien(ses), jefe: ses.jefe, at: new Date().toISOString(), min_desp: minDesde(p.created_at), nota: null, coment: null, cal_por: null, cal_at: null };
+    const { data, error } = await sb.from("pedido_fotos").upsert(row, { onConflict: "pedido_id" }).select("*").single();
+    if (error) { await removeFotos([path]); throw error; }
+    if (prev?.foto) await removeFotos([prev.foto]);
+    const url = (await signed([path]))[path];
+    if (url) await sb.rpc("tg_foto_pedido", { p_id: data.id, p_url: url });
+    return { foto: data, url, a_tiempo: data.min_desp <= S.FOTO_MIN };
+  },
+
+  async pedidos_dia(b) {
+    const ses = await getSession(b.token);
+    if (!ses.jefe) throw new HttpErr(403, "No tienes acceso a los registros.");
+    const fecha = /^\d{4}-\d{2}-\d{2}$/.test(b.fecha || "") ? b.fecha : S.jornadaOf(Date.now());
+    const lista = await pedidosConFoto(inicioJornadaIso(fecha), inicioJornadaIso(S.addDays(fecha, 1)));
+    return { fecha, lista, urls: await signed(lista.filter((x: any) => x.foto).map((x: any) => x.foto.foto)) };
+  },
+
+  async pedido_calificar(b) {
+    const ses = await getSession(b.token);
+    if (!ses.jefe) throw new HttpErr(403, "Solo supervisores y administrador califican.");
+    const nota = b.nota == null ? null : Number(b.nota);
+    if (nota != null && ![1, 2, 3, 4].includes(nota)) throw new HttpErr(400, "Calificación no válida.");
+    const row: any = { cal_por: quien(ses), cal_at: new Date().toISOString() };
+    if (b.nota !== undefined) row.nota = nota;
+    if (b.coment !== undefined) row.coment = String(b.coment || "").trim().slice(0, 300) || null;
+    const { data, error } = await sb.from("pedido_fotos").update(row).eq("id", b.id).select("*").single();
+    if (error || !data) throw new HttpErr(404, "Esa foto ya no existe.");
+    await avisarCalificada(data);
+    return { foto: data };
+  },
+
+  async turnos_guardar(b) {
+    const ses = await getSession(b.token);
+    if (!ses.admin) throw new HttpErr(403, "Solo el administrador.");
+    const out: any = {};
+    for (const k of ["t1", "t2"]) {
+      const t = b.turnos?.[k] || {};
+      if (S.hhmmToMin(t.ini) == null || S.hhmmToMin(t.fin) == null || t.ini === t.fin) throw new HttpErr(400, "Revisa las horas de los turnos.");
+      out[k] = { ini: t.ini, fin: t.fin };
+    }
+    await sb.from("config").upsert({ clave: "turnos", valor: out });
+    return { turnos: out };
+  },
+
+  /* Llamados por la base (x-cron-key): pedido nuevo, revisión cada 5 min y calificación desde Telegram. */
+  async pedido_nuevo(b, req) {
+    const s = await secrets(); if (req.headers.get("x-cron-key") !== s.cron) throw new HttpErr(403, "No autorizado.");
+    const { data: p } = await sb.from("delivery_pedidos").select("*").eq("id", String(b.id || "")).maybeSingle();
+    if (!p || minDesde(p.created_at) > S.FOTO_VENTANA) return { ok: true, nada: true };
+    await notifyEnTurno({ title: "📷 Foto del pedido: " + tituloPedido(p), body: resumenPedido(p) + ". Tómale foto antes de entregarlo.", tag: "ped-" + p.id });
+    return { ok: true };
+  },
+
+  async revisar_fotos(_b, req) {
+    const s = await secrets(); if (req.headers.get("x-cron-key") !== s.cron) throw new HttpErr(403, "No autorizado.");
+    const ahora = Date.now();
+    const lista = await pedidosConFoto(new Date(ahora - S.FOTO_VENTANA * 60e3).toISOString(), new Date(ahora - S.FOTO_MIN * 60e3).toISOString());
+    let enviados = 0;
+    for (const x of lista.filter((y: any) => !y.foto)) {
+      const { error } = await sb.from("avisos").insert({ clave: "foto-tarde:" + x.id });
+      if (error) continue;
+      enviados++;
+      await notifyEnTurno({ title: "⚠️ " + (PLAT_N[x.plat] || x.plat) + " #" + x.code + " lleva " + minDesde(x.at) + " min sin foto", body: x.resumen + ". Tómale foto antes de que se vaya.", tag: "ped-" + x.id });
+    }
+    const j = S.jornadaOf(ahora);
+    const { error: ya } = await sb.from("avisos").insert({ clave: "limpia-fotos:" + j });
+    if (!ya) {
+      const { data: viejas } = await sb.from("pedido_fotos").select("id,foto").lt("fecha", S.addDays(j, -S.FOTO_DIAS)).limit(500);
+      if (viejas?.length) { await removeFotos(viejas.map((v: any) => v.foto)); await sb.from("pedido_fotos").delete().in("id", viejas.map((v: any) => v.id)); }
+    }
+    return { ok: true, enviados };
+  },
+
+  async foto_calificada(b, req) {
+    const s = await secrets(); if (req.headers.get("x-cron-key") !== s.cron) throw new HttpErr(403, "No autorizado.");
+    const { data } = await sb.from("pedido_fotos").select("*").eq("id", String(b.id || "")).maybeSingle();
+    if (data) await avisarCalificada(data);
+    return { ok: true };
+  },
+
   /* Lo llama el reloj de Supabase cada 5 minutos. Avisa una sola vez por cada horario atrasado. */
   async revisar_atrasos(_b, req) {
     const s = await secrets();
@@ -689,6 +846,7 @@ const handlers: Record<string, (b: Body, req: Request) => Promise<unknown>> = {
 };
 
 Deno.serve(async (req) => {
+  PRUEBA = new URL(req.url).pathname.includes("-prueba");
   if (req.method === "OPTIONS") return new Response("ok", { headers: CORS });
   if (req.method !== "POST") return json({ error: "Método no permitido" }, 405);
   let body: Body;
