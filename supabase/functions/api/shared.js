@@ -303,11 +303,37 @@ export function porPersonaDia(docs, j, now, ini) {
 }
 const NPTS = { 4: 2, 3: 1, 2: 0, 1: -1 };
 /* Puntos de la semana: a tiempo +3, tarde +1, repetir -2, calificación 🟢+2 🟡+1 🟠0 🔴-1, entrega completa +5 y su calificación general ×2. */
-export function puntosSemana(dias, entregas) {
+/* ---------- Fotos de pedidos de delivery ---------- */
+export const FOTO_MIN = 15;      /* minutos para tomar la foto a tiempo */
+export const FOTO_VENTANA = 60;  /* solo se piden fotos de pedidos registrados en la última hora */
+export const FOTO_DIAS = 60;     /* las fotos se guardan 60 días */
+export const TURNOS_DEF = { t1: { ini: "09:00", fin: "17:00" }, t2: { ini: "15:00", fin: "23:30" } };
+export const HOR_NAME = { t1: "1er turno", t2: "2º turno", otro: "Otro horario", todo: "Todo el día" };
+/* Rango [ini, fin) en minutos del día del horario de una persona; null = todo el día. */
+export function rangoHorario(h, turnos) {
+  if (!h || !h.tipo || h.tipo === "todo") return null;
+  const t = h.tipo === "otro" ? h : (turnos || TURNOS_DEF)[h.tipo];
+  const a = hhmmToMin(t && t.ini), z = hhmmToMin(t && t.fin);
+  return a == null || z == null || a === z ? null : [a, z];
+}
+export function enHorario(h, turnos, cm) {
+  const r = rangoHorario(h, turnos); if (!r) return true;
+  return r[0] < r[1] ? cm >= r[0] && cm < r[1] : cm >= r[0] || cm < r[1];
+}
+export function horarioTxt(h, turnos) {
+  if (!h || !h.tipo || h.tipo === "todo") return HOR_NAME.todo;
+  const r = rangoHorario(h, turnos); if (!r) return HOR_NAME.todo;
+  const f = (m) => pad(Math.floor(m / 60) % 24) + ":" + pad(m % 60);
+  return (h.tipo === "otro" ? "" : HOR_NAME[h.tipo] + " · ") + f(r[0]) + "–" + f(r[1]);
+}
+
+export function puntosSemana(dias, entregas, fotos) {
   const t = {};
   const P = (id, nombre) => (t[id] = t[id] || { id, nombre, pts: 0, ok: 0, late: 0, rep: 0, ent: 0, notas: [] });
   dias.forEach((pp) => Object.entries(pp).forEach(([id, x]) => { const p = P(id, x.nombre); p.ok += x.ok; p.late += x.late; p.rep += x.rep; p.notas.push(...x.notas); }));
   (entregas || []).forEach((e) => { if (!e.emp_id || e.estado !== "entregado") return; const p = P(e.emp_id, e.nombre); p.ent++; p.pts += 5; const c = califEntrega(e); if (c.nota) p.pts += NPTS[c.nota] * 2; });
+  // Fotos de pedidos: a tiempo +2, tarde +1, y su calificación como en las entregas. Supervisores y administrador no compiten.
+  (fotos || []).forEach((f) => { if (!f.emp_id || f.jefe) return; const p = P(f.emp_id, f.nombre); p.fot = (p.fot || 0) + 1; p.pts += f.min_desp != null && f.min_desp <= FOTO_MIN ? 2 : 1; if (f.nota) p.pts += NPTS[f.nota] * 2; });
   Object.values(t).forEach((p) => { p.pts += p.ok * 3 + p.late - p.rep * 2 + p.notas.reduce((a, n) => a + NPTS[n], 0); const c = p.notas.length ? p.notas.reduce((a, b) => a + b, 0) / p.notas.length : null; p.nota = notaDe(c); delete p.notas; });
   return Object.values(t).sort((a, b) => b.pts - a.pts || b.ok - a.ok);
 }

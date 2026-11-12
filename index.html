@@ -551,6 +551,15 @@ html{background:var(--bg)}body{background:transparent!important}
 .etips>b{display:flex;align-items:center;gap:6px;font-size:15px}.etips>b svg{width:18px;height:18px;color:var(--honey-d)}
 .tip{display:flex;gap:10px;align-items:flex-start;font-size:13px;color:var(--mu)}.tip>span:first-child{font-size:20px;line-height:1}
 .tip b{display:block;color:var(--ink);font-size:13px}
+/* ---- v6: fotos de pedidos de delivery ---- */
+.ptag{display:inline-block;border-radius:6px;padding:2px 6px;font:800 10px/1.3 var(--fb);color:#fff;margin-right:5px;vertical-align:1px;background:var(--mu);letter-spacing:.02em}
+.ptag.uber{background:#1F7A4D}.ptag.didi{background:#C4570B}.ptag.rappi{background:#D0204F}.ptag.resv{background:#6B5BD6}
+.pill.hr{background:color-mix(in srgb,#85B7EB 30%,transparent);color:#1E4E7E}
+:root[data-theme=dark] .pill.hr{color:#A9CDF2}
+@media (prefers-color-scheme:dark){:root:not([data-theme=light]) .pill.hr{color:#A9CDF2}}
+.row.green{--st:var(--ok)}
+.row .tx .ptag{display:inline-block;color:#fff;font-size:10px;margin-top:0}
+.row .tx em.st{font-style:normal;display:inline}
 @media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
 </style>
 </head>
